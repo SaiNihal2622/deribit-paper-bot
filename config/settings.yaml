@@ -1,0 +1,120 @@
+# Crypto Options Paper Bot — default config
+# Read by crypto_options_bot/__main__.py
+
+mode: paper  # 'paper' or 'live' (CLI subcommand overrides)
+
+broker:
+  type: paper
+  paper_capital: 100000.0      # USD
+  slippage_bps: 5.0            # 5 bps = 0.05% slippage on market orders
+  limit_fill_spread_pct: 0.1   # synthetic spread for LIMIT fill sim (%)
+  limit_fill_min_spread: 0.01  # min spread in absolute units (e.g. $0.01)
+  fill_mode: market_like       # 'market_like' | 'aggressive_limit' | 'realistic_limit'
+  persist_path: data_cache/paper_state.json
+  live:
+    persist_path: data_cache/live_state.json  # used by DeribitClient
+
+data:
+  feed_mode: ws                # 'ws' (real-time WebSocket) or 'rest' (2s REST polling)
+  deribit_env: testnet         # 'testnet' or 'prod'
+  currencies: [BTC, ETH]
+  poll_interval_sec: 2.0       # used by the REST fallback feed
+  strike_window_pct: 0.20      # emit strikes within +/-20% of spot
+  iv_cache_sec: 30.0           # mark_iv cache lifetime (REST only)
+  # NEW: mark-price proxy — when bid/ask are both 0 but LTP > 0 (sparse
+  # testnet), treat LTP as both bid and ask so the limit-fill simulator
+  # can still fill end-to-end. Set false for stricter fill behavior.
+  mark_price_proxy: true
+  # NEW: skip strategies when the IV rank falls below this floor AND data
+  # quality is bad (no real DVOL, no ATM IV). Default 30 — matches the
+  # "premiums too low" floor used by the iron condor.
+  min_iv_rank_to_trade: 30
+  ws:
+    reconnect_delay_sec: 2.0
+    max_reconnect_attempts: 10
+    max_strikes_per_underlying: 9   # ATM +/- 4 strikes by default
+    dvol_cache_sec: 300              # DVOL index cache lifetime
+
+risk:
+  r: 0.045                     # risk-free rate (US 10Y proxy)
+  starting_capital: 100000.0
+  max_open_positions: 4
+  max_daily_loss_pct: 5.0
+  max_trade_loss_pct: 2.0
+  high_dvol_threshold: 80.0
+  high_iv_rank_threshold: 75.0
+  losses_to_defensive: 3       # N consecutive losses -> defensive preset
+  wins_to_aggressive: 5        # N consecutive wins -> aggressive preset
+  # NEW: adaptive risk presets. The engine picks one based on DVOL
+  # and recent trade results. Each preset overrides the caps above.
+  presets:
+    aggressive:
+      max_open_positions: 6
+      max_daily_loss_pct: 6.0
+      max_trade_loss_pct: 2.5
+      high_dvol_threshold: 90.0
+      high_iv_rank_threshold: 80.0
+    base:
+      max_open_positions: 4
+      max_daily_loss_pct: 5.0
+      max_trade_loss_pct: 2.0
+      high_dvol_threshold: 80.0
+      high_iv_rank_threshold: 75.0
+    defensive:
+      max_open_positions: 2
+      max_daily_loss_pct: 2.5
+      max_trade_loss_pct: 1.0
+      high_dvol_threshold: 60.0
+      high_iv_rank_threshold: 55.0
+
+strategy:
+  cooldown_sec: 300            # don't re-fire same strategy within 5 min
+  iron_condor:
+    wing_width_atm_mult: 0.03  # wing = 3% of spot (tighter for testnet liquidity)
+    short_delta: 0.16
+    profit_target_pct: 50
+    stop_loss_multiplier: 2.0
+    min_iv_rank: 30            # NEW: configurable (was hard-coded 40)
+    max_dvol: 90.0             # NEW: configurable (was hard-coded 90)
+  short_strangle:
+    short_delta: 0.20
+    wing_atm_mult: 0.04
+    profit_target_pct: 50
+    stop_loss_multiplier: 2.0
+    min_iv_rank: 50            # NEW: configurable (was hard-coded 50)
+    max_dvol: 80.0             # NEW: configurable (was hard-coded 80)
+  directional_debit:           # NEW strategy: single-leg long option
+    min_momentum: 0.02
+    min_iv_rank: 20.0
+    max_iv_rank: 80.0
+    stop_multiple: 0.5         # stop at 50% of debit
+    target_multiple: 1.0       # target at 100% of debit
+    min_dte: 7
+    max_dte: 14
+    confidence: 0.55
+  calendar_spread:             # NEW strategy: time-decay
+    min_iv_rank: 20.0
+    max_iv_rank: 50.0
+    near_dte: 7
+    far_dte: 28
+    stop_multiple: 2.0
+    target_multiple: 0.5
+    confidence: 0.5
+  long_straddle:               # NEW strategy: vol expansion
+    min_iv_rank: 30.0
+    max_iv_rank: 90.0
+    stop_multiple: 0.5
+    target_multiple: 1.0
+    confidence: 0.5
+
+alerts:
+  telegram:
+    enabled: false             # auto-enables if TELEGRAM_BOT_TOKEN+CHAT_ID are set
+
+dashboard:
+  enabled: true
+  port: 8511                   # default; override with --dashboard-port
+
+logging:
+  level: INFO
+  file: logs/bot.log

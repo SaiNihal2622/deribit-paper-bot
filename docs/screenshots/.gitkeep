@@ -1,0 +1,6 @@
+Drop PNG/JPG screenshots here. The README references the following files:
+
+- `dashboard.png`        — main dashboard page
+- `api_status.png`       — /api/status JSON response
+- `api_ticks.png`        — /api/ticks JSON stream
+- `bot_log.png`          — terminal log of a live paper run
