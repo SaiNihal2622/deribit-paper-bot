@@ -206,7 +206,11 @@ class LLMClient:
         url = f"{self.base_url.rstrip('/')}/messages"
         headers = {
             "Content-Type": "application/json",
-            "x-api-key": self.api_key,
+            # The MiniMax proxy at /mavis/api/v1/llm/v1 fronts an
+            # Anthropic-compatible Messages endpoint but uses Bearer-token
+            # auth, not Anthropic's native x-api-key. Match what
+            # .minimax/.builtin-skills/llm-call/scripts/llm_call.py does.
+            "Authorization": f"Bearer {self.api_key}",
             "anthropic-version": "2023-06-01",
         }
         if extra_headers:

@@ -17,7 +17,9 @@ class TestSentinel(unittest.TestCase):
         self.mem = Memory(root=self.root / "memory")
         self.heartbeat = self.root / "data_cache" / "heartbeat.json"
         self.heartbeat.parent.mkdir(parents=True, exist_ok=True)
-        self.heartbeat.write_text('{"ts": 1}', encoding="utf-8")
+        self.heartbeat.write_text(
+            '{"ts": 1, "open_trades": 1, "positions": 0, "pending_orders": 0}', encoding="utf-8"
+        )
         self.state = self.root / "data_cache" / "paper_state.json"
         self.state.write_text(
             '{"open_trades": {"t1": {}}, "positions": {}, "orders": {}}', encoding="utf-8"
@@ -55,7 +57,13 @@ class TestSentinel(unittest.TestCase):
         self.assertIsNone(self.sentinel._heartbeat_age_sec())
 
     def test_missing_state_file(self) -> None:
+        # Heartbeat is now the primary source; if it has counts we use them.
         self.state.unlink()
+        self.assertEqual(self.sentinel._read_counts(), (1, 0, 0))
+
+    def test_missing_both_files(self) -> None:
+        self.state.unlink()
+        self.heartbeat.unlink()
         self.assertEqual(self.sentinel._read_counts(), (0, 0, 0))
 
 

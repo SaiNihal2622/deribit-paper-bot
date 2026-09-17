@@ -8,9 +8,10 @@ $Heartbeat = Join-Path $ProjectDir "data_cache\operator.heartbeat"
 
 # 1. Process alive?
 $alive = $false
+$opPid = $null
 if (Test-Path $PidFile) {
-    $pid = Get-Content $PidFile -ErrorAction SilentlyContinue
-    if ($pid -and (Get-Process -Id $pid -ErrorAction SilentlyContinue)) {
+    $opPid = Get-Content $PidFile -ErrorAction SilentlyContinue
+    if ($opPid -and (Get-Process -Id $opPid -ErrorAction SilentlyContinue)) {
         $alive = $true
     }
 }
@@ -30,5 +31,5 @@ if ($age.TotalSeconds -gt 300) {
     exit 1
 }
 
-Write-Host "[OK] operator PID=$pid, heartbeat=$($age.TotalSeconds)s old"
+Write-Host "[OK] operator PID=$opPid, heartbeat=$($age.TotalSeconds)s old"
 exit 0

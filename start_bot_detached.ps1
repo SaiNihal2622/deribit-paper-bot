@@ -19,6 +19,15 @@ $ProjectDir = "C:\Users\saini\.minimax-agent\projects\crypto-options-bot"
 $LogDir     = Join-Path $ProjectDir "logs"
 $VenvPy     = Join-Path $ProjectDir ".venv\Scripts\python.exe"
 
+# Prefer a project-local venv; fall back to whatever `python` is on PATH
+# (no admin needed, no install step required for dev boxes).
+if (Test-Path $VenvPy) {
+    $Py = $VenvPy
+} else {
+    $Py = (Get-Command python).Source
+    Write-Host "  (no .venv found - using system python: $Py)"
+}
+
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
 
 $stdout = Join-Path $LogDir "bot_stdout.log"
@@ -26,11 +35,11 @@ $stderr = Join-Path $LogDir "bot_stderr.log"
 
 $args = @('-u','-m','crypto_options_bot', $Mode, '--feed', $Feed, '--dashboard-port', $DashboardPort)
 
-Write-Host "Launching: $VenvPy $($args -join ' ')"
+Write-Host "Launching: $Py $($args -join ' ')"
 Write-Host "  stdout: $stdout"
 Write-Host "  stderr: $stderr"
 
-$proc = Start-Process -FilePath $VenvPy `
+$proc = Start-Process -FilePath $Py `
                       -ArgumentList $args `
                       -WorkingDirectory $ProjectDir `
                       -RedirectStandardOutput $stdout `
@@ -38,3 +47,4 @@ $proc = Start-Process -FilePath $VenvPy `
                       -NoNewWindow `
                       -PassThru
 Write-Host "  PID = $($proc.Id)"
+Set-Content -Path (Join-Path $LogDir "bot.pid") -Value $proc.Id

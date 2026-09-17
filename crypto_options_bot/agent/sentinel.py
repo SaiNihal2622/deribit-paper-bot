@@ -124,7 +124,7 @@ class Sentinel:
                         "-Command",
                         "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
                         "| Where-Object { $_.CommandLine -like '*crypto_options_bot*' } "
-                        "| Select-Object -FirstProperty ProcessId",
+                        "| Select-Object -ExpandProperty ProcessId",
                     ],
                     capture_output=True,
                     text=True,
@@ -156,16 +156,41 @@ class Sentinel:
             return None
 
     def _ws_subscribed(self) -> int:
-        # Lazy import so the Sentinel doesn't crash if the WS feed
-        # happens to be reimporting during a sentinel tick.
+        # Prefer the bot's own heartbeat.json (cross-process safe).
+        # Fall back to the in-process feed singleton if it ever exists
+        # in the same process as the sentinel (e.g. unit tests).
+        try:
+            if self.heartbeat_path.exists():
+                with open(self.heartbeat_path, encoding="utf-8") as fh:
+                    hb = json.load(fh)
+                ws = int(hb.get("ws_subscribed", 0) or 0)
+                if ws > 0:
+                    return ws
+        except Exception:  # noqa: BLE001
+            pass
+
         try:
             from crypto_options_bot.data.deribit_ws import get_feed
 
-            return len(get_feed().subscribed_channels)
+            return len(get_feed()._subscribed_channels)
         except Exception:  # noqa: BLE001
             return 0
 
     def _read_counts(self) -> tuple[int, int, int]:
+        # Prefer the bot's heartbeat.json (in-memory counts are more
+        # current than the persisted JSON, which is updated on event).
+        try:
+            if self.heartbeat_path.exists():
+                with open(self.heartbeat_path, encoding="utf-8") as fh:
+                    hb = json.load(fh)
+                return (
+                    int(hb.get("open_trades", 0) or 0),
+                    int(hb.get("positions", 0) or 0),
+                    int(hb.get("pending_orders", 0) or 0),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
         if not self.state_path.exists():
             return 0, 0, 0
         try:

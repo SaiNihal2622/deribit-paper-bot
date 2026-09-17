@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import signal
 import sys
@@ -686,6 +687,35 @@ class PaperRunner:
                     f"  pos: {p.symbol} qty={p.qty:+d} avg={p.avg_price:.4f} "
                     f"ltp={p.ltp:.4f} pnl={p.pnl:,.2f}"
                 )
+
+        # NEW: write a heartbeat file for the Sentinel agent.
+        # The sentinel runs in a separate process and cannot reach into
+        # this one's feed singleton, so we publish what it needs to disk.
+        try:
+            ws_subscribed = len(getattr(feed, "_subscribed_channels", set()) or set())
+            payload = {
+                "ts": time.time(),
+                "cycle": self._cycle_count,
+                "mode": self.mode,
+                "feed": feed_label,
+                "ws_connected": bool(ws_connected),
+                "ws_subscribed": int(ws_subscribed),
+                "open_trades": len(open_trades),
+                "positions": len(positions),
+                "realized_pnl": float(realized),
+                "unrealized_pnl": float(unrealized),
+                "preset": risk_status.get("preset", "?"),
+                "pid": os.getpid(),
+            }
+            hb_path = os.path.join("data_cache", "heartbeat.json")
+            tmp = hb_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, default=str)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, hb_path)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"heartbeat.json write failed (non-fatal): {e}")
 
     def _monitor_targets_stops(self, broker, order_mgr) -> None:
         """Auto-close open trades whose combined P&L hits target or stop."""
