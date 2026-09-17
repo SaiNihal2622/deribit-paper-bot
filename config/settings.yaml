@@ -118,3 +118,24 @@ dashboard:
 logging:
   level: INFO
   file: logs/bot.log
+
+# ---------------------------------------------------------------------------
+# 6-agent self-evolving system (python -m crypto_options_bot operator)
+# ---------------------------------------------------------------------------
+agent:
+  enabled: true
+  llm_model: minimax/MiniMax-M3    # default; pick a faster model for cost
+  memory_dir: memory
+  sentinel_interval_sec: 60.0
+  evolver_interval_sec: 21600.0     # 6 hours
+  reflector_at_hhmm: "00:05"        # daily, UTC
+  heartbeat_interval_sec: 30.0
+  daily_token_limit: 500000
+  daily_call_limit: 5000
+  # Autonomy: low-risk evolver proposals are deployed automatically.
+  # High-risk proposals (3+ keys, max_open_positions, >20% changes)
+  # always wait for human approval.
+  autonomy: moderate
+  # If true, the operator will fall back to rule-based decisions when the
+  # LLM is unavailable or the daily budget is exhausted.
+  fallback_enabled: true

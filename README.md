@@ -9,15 +9,16 @@ WebSocket market data · Black-Scholes Greeks · 5 multi-leg strategies · stdli
 <br>
 
 [![Python](https://img.shields.io/badge/python-3.12-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-43%2F43%20passing-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](tests/)
+[![Tests](https://img.shields.io/badge/tests-119%2B1%20passing-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](tests/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](LICENSE)
 [![Exchange](https://img.shields.io/badge/exchange-Deribit-orange?style=for-the-badge)](https://deribit.com)
 [![Mode](https://img.shields.io/badge/mode-paper%20trading-yellow?style=for-the-badge)]()
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?style=for-the-badge)](https://www.python.org/downloads/)
+[![Agents](https://img.shields.io/badge/agents-6%20self--healing-blueviolet?style=for-the-badge)](crypto_options_bot/agent/)
+[![LLM](https://img.shields.io/badge/LLM-MiniMax%20M3-7c3aed?style=for-the-badge)](https://agent.minimax.io)
 
 <br>
 
-[**Quick Start**](#-quick-start) · [**Architecture**](#-architecture) · [**Strategies**](#-strategies) · [**Production**](#-production-deployment) · [**Docs**](#-documentation)
+[**Quick Start**](#-quick-start) · [**Architecture**](#-architecture) · [**Strategies**](#-strategies) · [**Production**](#-production-deployment) · [**Self-evolving]((#-6-agent-self-evolving-system)) · [**Docs**](#-documentation)
 
 </div>
 
@@ -31,10 +32,12 @@ A **complete, production-grade crypto options paper-trading system** that:
 - 🧮 Computes **Black-Scholes Greeks** from scratch (no scipy) and uses real Deribit `mark_iv`
 - 🎯 Runs **five multi-leg strategies** through a risk engine with adaptive presets
 - 📊 Serves a **read-only stdlib HTTP dashboard** (no Flask/FastAPI dependency) on `:8511`
-- 🛡️ Survives unattended 24/7 with a **6-layer supervision stack** (NSSM service + watchdog + heartbeat + scheduled tasks)
+- 🛡️ Survives unattended 24/7 with a **7-layer supervision stack** (6 hard layers + 1 optional LLM layer; NSSM service + watchdog + heartbeat + scheduled tasks + supervisor with exponential backoff + the optional agent operator)
+- 🤖 **Watches, heals, and evolves itself** with an optional **6-agent self-evolving / self-healing operator** driven by the local [MiniMax M3](https://agent.minimax.io) LLM (see [below](#-6-agent-self-evolving-system))
 - 🚀 Flips to **live trading** with one CLI flag and three env vars — `DERIBIT_LIVE_CONFIRMED=YES`
 
 > **Paper by default.** No real orders, no exchange auth, no real money. Public Deribit market-data endpoints need no credentials at all.
+> The agent layer is **optional** — the bot runs and trades the same way with or without the operator. Without an LLM key, the agents fall back to rule-based decisions.
 
 ---
 
@@ -47,7 +50,8 @@ A **complete, production-grade crypto options paper-trading system** that:
 | **Risk** | Max open positions · daily loss cap · per-trade stop · adaptive presets (aggressive / base / defensive) based on DVOL + recent P&L streak |
 | **Trade mgmt** | Per-trade target/stop monitor · mark-to-market at bid/ask · persistent JSON state + CSV telemetry |
 | **Ops** | stdlib dashboard (port 8511) · Telegram alerter · NSSM service installer · watchdog · 5-min heartbeat · daily housekeeping · supervisor with exponential backoff |
-| **Dependency footprint** | `loguru`, `pyyaml`, `python-dotenv`, `websocket-client`, `pytest` only. HTTP via `urllib`, dashboard via `http.server` — no `requests`, no `flask`, no `pandas`, no `numpy` |
+| **Self-evolving layer** *(optional)* | 6 LLM-driven agents — Sentinel (probe) · Healer (recover) · Trader (veto/dowsize) · Evolver (propose+deploy safe config changes) · Reflector (daily lessons) · Operator (orchestrator) |
+| **Dependency footprint** | `loguru`, `pyyaml`, `python-dotenv`, `websocket-client`, `pytest`, `httpx` (LLM only) only. HTTP via `urllib`, dashboard via `http.server` — no `requests`, no `flask`, no `pandas`, no `numpy` |
 
 ---
 
@@ -269,9 +273,9 @@ See the full reference in [Configuration reference](config/settings.yaml).
 
 ---
 
-## 🛰 Production deployment (6-layer supervision)
+## 🛰 Production deployment (7-layer supervision with optional agent operator)
 
-Crypto is 24/7, so the bot is designed to run unattended. The stack mirrors the mature kotak-neo-bot production setup:
+Crypto is 24/7, so the bot is designed to run unattended. The stack mirrors the mature kotak-neo-bot production setup, with an optional **7th layer** — the LLM-driven agent operator — on top:
 
 | Layer | Mechanism | File | What it does |
 |---:|---|---|---|
@@ -281,6 +285,7 @@ Crypto is 24/7, so the bot is designed to run unattended. The stack mirrors the 
 | 4 | Watchdog | `watchdog.ps1` | Polls bot + dashboard port; respawns via `start_bot_detached.ps1` if dead |
 | 5 | Scheduled heartbeat | `heartbeat.ps1` | Every 5 min: health, log scan, decision log |
 | 6 | Daily housekeeping | `daily_reset.ps1` | Archives CSVs to `logs/archive/`, rotates logs > 20 MB |
+| 7 | **Operator** *(optional)* | `scripts/start_operator.ps1` + `start_bot_service.ps1 install-operator` | LLM-driven self-healing + self-evolving layer (see [below](#-6-agent-self-evolving-system)) |
 
 ### Quick recipes
 
@@ -291,6 +296,7 @@ Crypto is 24/7, so the bot is designed to run unattended. The stack mirrors the 
 # NSSM service (auto-start on boot, requires admin)
 .\start_bot_service.ps1 install              # registers CryptoOptionsBot
 .\start_bot_service.ps1 install-dashboard    # registers CryptoOptionsDashboard (:8511)
+.\start_bot_service.ps1 install-operator     # registers CryptoOptionsOperator (6-agent layer)
 .\start_bot_service.ps1 status
 .\start_bot_service.ps1 remove
 
@@ -320,6 +326,199 @@ alive4=2 allBot=2
   bot alive (alive4=2 allBot=2) -> no restart
 === END HEARTBEAT ===
 ```
+
+---
+
+## 🤖 6-agent self-evolving system
+
+The bot is wrapped by an **optional** second loop — the *Operator* — that watches, heals, and quietly evolves the system. It runs as its own long-lived process (`python -m crypto_options_bot operator`) driven by an LLM (default: MiniMax M3). **The bot does not depend on it** — if the Operator is down, the bot keeps trading and the dashboards stay up.
+
+```mermaid
+graph TB
+    subgraph "Operator (LLM-driven, optional)"
+        OP[Operator<br/>scheduler · status · budget]
+
+        subgraph "Loop @60s"
+            SE[Sentinel<br/>probe bot · heartbeat · WS · disk]
+            HE[Healer<br/>playbooks: bot_dead · ws_no_channels ·<br/>heartbeat_warn · orphans · disk_low]
+        end
+
+        subgraph "Loop @6h"
+            EV[Evolver<br/>reads journal · proposes JSON diffs ·<br/>auto-deploys low-risk (±20% rel, ±5% abs)]
+        end
+
+        subgraph "Loop @daily 00:05 UTC"
+            RF[Reflector<br/>writes memory/lessons/YYYY-MM-DD-<slug>.md]
+        end
+
+        TR[Trader<br/>wraps the 5 strategies;<br/>LLM returns APPROVE / VETO /<br/>DOWNSIZE / HOLD with target_qty]
+
+        TO[ToolRegistry<br/>read_paper_state · read_settings ·<br/>list_lessons · list_proposals ·<br/>approve_proposal · reject_proposal · write_journal]
+
+        ME[Memory<br/>state/ · history/ · lessons/ ·<br/>proposals/ · health/ · journal/]
+
+        LL[LLMClient<br/>MiniMax · Anthropic-compatible<br/>budget · retry · mockable]
+    end
+
+    subgraph "Bot (always runs)"
+        BOT[Paper / Live runner]
+        OM[OrderManager]
+        RE[RiskEngine]
+    end
+
+    SE -->|health report| HE
+    HE -->|restart bot, free port, etc.| BOT
+    TR -->|veto / downsize| BOT
+    TR -->|advisory only| OM
+    BOT -.->|paper_state.json| SE
+    BOT -.->|paper_state.json| TR
+    BOT -.->|trade_events.csv| EV
+
+    SE --> ME
+    HE --> ME
+    TR --> ME
+    EV --> ME
+    RF --> ME
+
+    TR --> LL
+    EV --> LL
+    RF --> LL
+
+    EV --> TO
+    TR --> TO
+    TO --> ME
+```
+
+### Agent catalog
+
+| # | Agent | File | Cadence | Job |
+|---|---|---|---|---|
+| 1 | **Sentinel** | `crypto_options_bot/agent/sentinel.py` | 60 s | Probe bot PID, dashboard port, log freshness, WS subscriptions, open positions, disk space |
+| 2 | **Healer** | `crypto_options_bot/agent/healer.py` | 60 s (right after Sentinel) | Match a HealthReport against playbooks (`bot_dead`, `heartbeat_warn`, `ws_no_channels`, `orphans`, `disk_low`) and run the cheapest recovery |
+| 3 | **Trader** | `crypto_options_bot/agent/trader.py` | every cycle (advisory) | Read the bot's next TradePlan, ask the LLM for APPROVE / VETO / DOWNSIZE / HOLD with a `target_qty`. Hard rails = `RiskEngine` (LLM can never widen caps) |
+| 4 | **Evolver** | `crypto_options_bot/agent/evolver.py` | 6 h | Read trade journal + paper state + last lesson, ask the LLM for a JSON config diff, classify risk, auto-deploy if within rails, else escalate to a human-approval proposal |
+| 5 | **Reflector** | `crypto_options_bot/agent/reflector.py` | daily @ 00:05 UTC | Read the day's trades + yesterday's lesson, write a Markdown lesson to `memory/lessons/` |
+| 6 | **Operator** | `crypto_options_bot/agent/operator.py` | always | Wires the above via a cron-like scheduler, owns shared `Memory` and `LLMClient`, writes its own heartbeat to `data_cache/operator.heartbeat` |
+
+### Autonomy tiers (per-agent)
+
+The blast radius matches the responsibility. **Trader and Healer can never modify code or strategy logic** — they only nudge the existing risk-aware execution path.
+
+| Agent | Can touch | Hard rails (cannot cross) |
+|---|---|---|
+| Healer | restart bot, free dashboard port, rotate logs | never edits strategy or risk code, never opens/closes positions |
+| Trader | `target_qty` (downward only), veto, hold | never widens `RiskEngine` caps, never changes strategy eligibility, never places orders directly |
+| Evolver | mutates `config/settings.yaml` | max ±20 % relative / ±5 percentage-point absolute per call; only known scalar keys; ≥3 keys always escalates; `max_open_positions` always escalates |
+| Reflector | writes to `memory/lessons/` only | read-only everywhere else |
+| Sentinel | none | reads only |
+| Operator | none directly; orchestrates the others | read-only on bot state, owns `Memory` and budget |
+
+Proposals that exceed rails land in `memory/proposals/*.json` with `status: pending` and are surfaced by `python scripts/operator_status.py`. The `approve_proposal` / `reject_proposal` tools are the human escape hatch.
+
+### LLM cost controls
+
+`agent:` block in `config/settings.yaml`:
+
+| Knob | Default | What it does |
+|---|---:|---|
+| `llm_model` | `minimax/MiniMax-M3` | Swap for a cheaper model when cost matters |
+| `daily_token_limit` | 500 000 | Hard cap; Operator skips discretionary calls once hit |
+| `daily_call_limit` | 5 000 | Hard cap on calls per UTC day |
+| `fallback_enabled` | `true` | When the LLM is unreachable or budget exhausted, agents fall back to rules (`APPROVE` for Trader, `no-op` for Evolver/Reflector) |
+| `autonomy` | `moderate` | Sets how aggressive Evolver is. `conservative` = always human-approve; `moderate` = auto-deploy low-risk only; `aggressive` = also deploy 3-key changes that stay within rails |
+
+### Prompt strategy
+
+Prompts live in `crypto_options_bot/agent/prompts/`:
+
+- `trader_system.md` — fixed system prompt: role, hard rails, JSON schema, examples
+- `trader_decision.md` — per-cycle template: spot, IV, strategy, plan, open trades
+- `evolver_review.md` — weekly-style review prompt with the full journal slice
+- `reflector_daily.md` — daily review prompt with P&L, win/loss, regime notes
+
+All prompts demand **strict JSON** output. The agents re-parse the LLM's reply with a permissive wrapper and degrade gracefully on parse errors (never crash the operator).
+
+### Memory layout (gitignored)
+
+```
+memory/
+  state/      sentinel_latest.json, healer_latest.json         # atomic JSON
+  history/    trader_decisions_YYYY-MM-DD.jsonl                 # append-only
+  lessons/    YYYY-MM-DD-<slug>.md                              # Reflector output
+  proposals/  <proposal_id>.json    status: pending|approved|deployed|rejected
+  health/     YYYY-MM-DD.jsonl                                 # Healer reports
+  journal/    YYYY-MM-DD.md                                    # every agent's notable decisions
+```
+
+The `memory/` folder is `.gitignore`d — every operator restart rebuilds state from the live bot + the existing JSONL history.
+
+### Running the operator
+
+```powershell
+# 1. Mint an LLM key and add to .env
+#    MINIMAX_API_KEY=sk-your-key-here
+
+# 2. 30-second smoke test
+python -m crypto_options_bot operator --max-runtime 30
+
+# 3. Detached 24/7 run
+.\scripts\start_operator.ps1
+
+# 4. Stop
+.\scripts\stop_operator.ps1
+
+# 5. Pretty-print status
+python scripts\operator_status.py
+
+# 6. Health probe (exit 0 = alive and fresh)
+powershell -File scripts\operator_health.ps1
+
+# 7. Register under Task Scheduler (probe every 5 min, restart on failure)
+powershell -File scripts\start_operator.ps1   # start once
+# then point Task Scheduler at scripts\operator_health.ps1 with an AtStartup trigger
+```
+
+### Operator status sample
+
+```
+============================================================
+  Crypto Options Bot — Operator Status
+============================================================
+  Cycles:          1742
+  Heartbeat age:    12.4s  (PID=13084)
+
+  Scheduled jobs:
+              sentinel   runs=1742  errors=0   next=48s
+              healer     runs=1742  errors=0   next=48s
+              evolver    runs=3     errors=0   next=21475s
+              reflector  runs=0     errors=0   next=14523s
+              heartbeat  runs=1742  errors=0   next=18s
+
+  Latest Sentinel probe:
+    BOT-DEAD, ws-no-channels pos=0 trades=0 ws=0
+
+  Latest Healer run:
+    ✓ bot_dead           sev=high   sentinel reports BOT-DEAD, no heartbeat < 300s
+    · ws_no_channels     sev=warn   WS not subscribed (will retry on next probe)
+
+  Recent Reflector lessons:
+    - 2026-09-17-iron-condor-tight-testnet.md
+============================================================
+```
+
+### Tests
+
+119 unit tests cover every agent (LLM calls mocked via `LLMClient(api_key="sk-test", mock=fn)` — zero network in CI). See:
+
+- `tests/test_agent_llm.py` — MiniMax API wrapper, budget, retry, mock
+- `tests/test_agent_memory.py` — atomic JSON writes, JSONL append, proposal state machine
+- `tests/test_agent_scheduler.py` — every_sec / at_hhmm, pause/resume, error caps
+- `tests/test_agent_tools.py` — read-only vs. write-state journal, args schema
+- `tests/test_agent_sentinel_healer.py` — every probe + playbook
+- `tests/test_agent_trader.py` — APPROVE / VETO / DOWNSIZE / HOLD + fallback path
+- `tests/test_agent_evolver.py` — diff validation, risk classification, auto-deploy rails
+- `tests/test_agent_reflector.py` — lesson filename + Markdown body shape
+- `tests/test_agent_operator.py` — wiring, status, heartbeat fsync
 
 ---
 
@@ -392,7 +591,15 @@ python -m crypto_options_bot paper --max-runtime 30 --verbose
 python -m crypto_options_bot paper --feed rest --max-runtime 30
 python -m crypto_options_bot paper --dashboard-port 8511
 python -m crypto_options_bot supervisor paper             # auto-restart loop
+python -m crypto_options_bot operator --max-runtime 30   # operator 30 s smoke
 python -m pytest tests/ -v
+```
+
+```powershell
+.\scripts\start_operator.ps1                            # detached operator
+.\scripts\stop_operator.ps1                             # graceful stop
+python scripts\operator_status.py                        # human-readable status
+powershell -File scripts\operator_health.ps1             # exit-0 probe for monitors
 ```
 
 ---
@@ -402,7 +609,7 @@ python -m pytest tests/ -v
 ```
 crypto-options-bot/
 ├── crypto_options_bot/
-│   ├── __main__.py              # CLI: paper / live / status / reset
+│   ├── __main__.py              # CLI: paper / live / status / reset / operator
 │   ├── supervisor.py            # Auto-restart on crash with exp backoff
 │   ├── data/
 │   │   ├── deribit_feed.py      # REST polling feed (2 s)
@@ -428,18 +635,37 @@ crypto-options-bot/
 │   │   └── telegram.py          # Optional TelegramAlerter
 │   ├── dashboard/
 │   │   └── server.py            # stdlib http.server + read-only HTML
+│   ├── agent/                   # 6-agent self-evolving system (optional)
+│   │   ├── __init__.py          # re-exports LLMClient, Memory, Scheduler
+│   │   ├── llm.py               # MiniMax API wrapper · budget · retry · mockable
+│   │   ├── memory.py            # atomic JSON · JSONL history · lessons · proposals
+│   │   ├── scheduler.py         # cron-like · every_sec | at_hhmm · pause/resume
+│   │   ├── tools.py             # LLM-callable functions (READ / WRITE_STATE)
+│   │   ├── sentinel.py          # process · heartbeat · WS · positions
+│   │   ├── healer.py            # bot_dead · heartbeat_warn · ws_no_channels · …
+│   │   ├── trader.py            # APPROVE / VETO / DOWNSIZE / HOLD wrapper
+│   │   ├── evolver.py           # journal-driven config diffs + auto-deploy rails
+│   │   ├── reflector.py         # daily lesson writer
+│   │   ├── operator.py          # top-level orchestrator
+│   │   └── prompts/             # LLM prompts (Markdown, versioned)
 │   └── utils/
 │       └── logger.py            # loguru sink config
-├── tests/                       # 43 unit tests
-│   ├── test_greeks.py           # Black-Scholes against known values
-│   ├── test_paper_broker.py     # order fill / avg / realized P&L
-│   ├── test_order_manager.py    # plan execution + state round-trip
-│   ├── test_risk_engine.py      # caps, presets, daily loss
-│   ├── test_strategies.py       # eligibility + leg-picking
-│   └── test_target_stop_monitor.py
+├── scripts/                     # operator lifecycle + status
+│   ├── start_operator.ps1       # detached launcher with PID file
+│   ├── stop_operator.ps1        # graceful kill
+│   ├── operator_health.ps1      # exit-0 probe for Task Scheduler
+│   └── operator_status.py       # pretty-print status snapshot
+├── tests/                       # 119 unit tests (1 skipped)
+│   ├── test_greeks.py
+│   ├── test_paper_broker.py
+│   ├── test_order_manager.py
+│   ├── test_risk_engine.py
+│   ├── test_strategies.py
+│   ├── test_target_stop_monitor.py
+│   └── test_agent_*.py          # 9 files covering the 6-agent layer
 ├── docs/screenshots/            # place README screenshots here
-├── config/settings.yaml         # all knobs
-├── start_bot_service.ps1        # NSSM installer
+├── config/settings.yaml         # all knobs (incl. agent: block)
+├── start_bot_service.ps1        # NSSM installer (+ install-operator)
 ├── start_bot_detached.ps1       # plain detached launcher
 ├── stop_bot_service.ps1
 ├── watchdog.ps1
@@ -462,7 +688,7 @@ crypto-options-bot/
 python -m pytest tests/ -v
 ```
 
-43 unit tests cover: Black-Scholes Greeks against known values, paper-broker fills + average price + realized P&L, order-manager plan execution + state persistence, risk engine caps + adaptive presets, all five strategies (eligibility + leg-picking), target/stop monitor.
+43 unit tests cover: Black-Scholes Greeks against known values, paper-broker fills + average price + realized P&L, order-manager plan execution + state persistence, risk engine caps + adaptive presets, all five strategies (eligibility + leg-picking), target/stop monitor. The agent layer adds **76 more tests** (LLM mocked, never makes a real network call): every agent's probe + playbook + decision path, the scheduler's `every_sec` / `at_hhmm` semantics, the LLM client's retry + budget, the memory layer's atomic writes, the operator's end-to-end wiring.
 
 ---
 
@@ -478,6 +704,14 @@ python -m pytest tests/ -v
 
 ## 🗺 Roadmap
 
+Delivered in this build:
+- ✅ 6-agent self-evolving / self-healing operator (LLM-driven, optional)
+- ✅ Strict JSON prompt contracts + LLM budget / fallback
+- ✅ Atomic JSON state + append-only JSONL history under `memory/`
+- ✅ Auto-deploy low-risk config changes; ≥3-key changes escalate to human-approval
+- ✅ Daily Markdown lessons written to `memory/lessons/`
+
+Coming next:
 - Backtesting harness (historical Deribit data)
 - More venues (Bybit options, OKX options)
 - ML-based regime / signal classifier

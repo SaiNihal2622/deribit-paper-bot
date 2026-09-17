@@ -9,7 +9,7 @@
 
 param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet('install','remove','status','install-dashboard','remove-dashboard')]
+    [ValidateSet('install','remove','status','install-dashboard','remove-dashboard','install-operator','remove-operator')]
     [string]$Action
 )
 
@@ -21,6 +21,7 @@ $NSSMDir     = Join-Path $ProjectDir "tools"
 $NSSM        = Join-Path $NSSMDir "nssm.exe"
 $BotService  = "CryptoOptionsBot"
 $DashService = "CryptoOptionsDashboard"
+$OperatorService = "CryptoOptionsOperator"
 
 function Ensure-NSSM {
     if (-not (Test-Path $NSSM)) {
@@ -91,9 +92,33 @@ function Install-DashboardService {
     Write-Host "Dashboard service installed and started on :8511"
 }
 
+function Install-OperatorService {
+    Ensure-NSSM
+    $Stdout = Join-Path $LogDir "operator_stdout.log"
+    $Stderr = Join-Path $LogDir "operator_stderr.log"
+    & $NSSM stop $OperatorService 2>$null
+    & $NSSM remove $OperatorService confirm 2>$null
+    Start-Sleep 1
+    & $NSSM install $OperatorService $VenvPython "-u -m crypto_options_bot operator"
+    & $NSSM set $OperatorService AppDirectory $ProjectDir
+    & $NSSM set $OperatorService AppStdout $Stdout
+    & $NSSM set $OperatorService AppStderr $Stderr
+    & $NSSM set $OperatorService AppRotateFiles 1
+    & $NSSM set $OperatorService AppRotateBytes 10485760
+    & $NSSM set $OperatorService DisplayName "Crypto Options 6-Agent Operator"
+    & $NSSM set $OperatorService Description "Sentinel+Healer+Trader+Evolver+Reflector. Self-evolving 24/7 LLM-driven agent layer."
+    & $NSSM set $OperatorService Start SERVICE_AUTO_START
+    & $NSSM set $OperatorService AppRestartDelay 5000
+    & $NSSM set $OperatorService AppThrottle 10000
+    & $NSSM set $OperatorService ExitActions Restart
+    & $NSSM set $OperatorService AppEnvironmentExtra "PYTHONPATH=$ProjectDir`nPYTHONUNBUFFERED=1"
+    & $NSSM start $OperatorService
+    Write-Host "Operator service installed and started (6-agent self-evolving layer)."
+}
+
 function Remove-AllServices {
     Ensure-NSSM
-    foreach ($svc in @($BotService, $DashService)) {
+    foreach ($svc in @($BotService, $DashService, $OperatorService)) {
         & $NSSM stop $svc 2>$null
         & $NSSM remove $svc confirm 2>$null
         Write-Host "Removed service: $svc"
@@ -101,7 +126,7 @@ function Remove-AllServices {
 }
 
 function Show-Status {
-    foreach ($svc in @($BotService, $DashService)) {
+    foreach ($svc in @($BotService, $DashService, $OperatorService)) {
         $s = Get-Service $svc -ErrorAction SilentlyContinue
         if ($null -eq $s) { Write-Host "$svc : NOT INSTALLED" }
         else { Write-Host "$svc : $($s.Status) (StartType: $($s.StartType))" }
@@ -121,12 +146,19 @@ function Show-Status {
 switch ($Action) {
     'install'           { Install-BotService; Show-Status }
     'install-dashboard' { Install-DashboardService; Show-Status }
+    'install-operator'  { Install-OperatorService; Show-Status }
     'remove'            { Remove-AllServices }
     'remove-dashboard'  {
         Ensure-NSSM
         & $NSSM stop $DashService 2>$null
         & $NSSM remove $DashService confirm 2>$null
         Write-Host "Removed service: $DashService"
+    }
+    'remove-operator'   {
+        Ensure-NSSM
+        & $NSSM stop $OperatorService 2>$null
+        & $NSSM remove $OperatorService confirm 2>$null
+        Write-Host "Removed service: $OperatorService"
     }
     'status'            { Show-Status }
 }

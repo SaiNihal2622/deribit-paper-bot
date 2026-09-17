@@ -1133,11 +1133,68 @@ def main(argv: list[str] | None = None) -> int:
     p_reset = sub.add_parser("reset", help="Clear paper state")
     p_reset.set_defaults(func=cmd_reset)
 
+    p_operator = sub.add_parser(
+        "operator",
+        help="Run the 6-agent self-evolving / self-healing operator loop",
+    )
+    p_operator.add_argument("--memory-dir", default="memory")
+    p_operator.add_argument("--sentinel-interval", type=float, default=60.0)
+    p_operator.add_argument("--evolver-interval", type=float, default=6 * 3600.0)
+    p_operator.add_argument("--reflector-at", default="00:05",
+                            help="Daily HH:MM (UTC) to run Reflector")
+    p_operator.add_argument("--heartbeat-interval", type=float, default=30.0,
+                            help="Operator's own liveness ping interval (s)")
+    p_operator.add_argument("--llm-model", default="minimax/MiniMax-M3")
+    p_operator.add_argument("--no-trader", action="store_true",
+                            help="Disable Trader (rule-based path only)")
+    p_operator.add_argument("--no-evolver", action="store_true")
+    p_operator.add_argument("--no-reflector", action="store_true")
+    p_operator.add_argument("--max-runtime", type=float, default=0.0,
+                            help="Stop operator after N seconds (0=forever)")
+    p_operator.set_defaults(func=cmd_operator)
+
     args = parser.parse_args(argv)
     if not getattr(args, "cmd", None):
         parser.print_help()
         return 1
     return args.func(args)
+
+
+# ---------------------------------------------------------------------------
+# operator subcommand
+# ---------------------------------------------------------------------------
+def cmd_operator(args: argparse.Namespace) -> int:
+    """Entry point for ``python -m crypto_options_bot operator``."""
+    from .agent.operator import Operator, OperatorConfig
+
+    project_root = Path(args.config).resolve().parent.parent
+    cfg = OperatorConfig(
+        project_root=project_root,
+        memory_dir=project_root / args.memory_dir,
+        sentinel_interval_sec=args.sentinel_interval,
+        evolver_interval_sec=args.evolver_interval,
+        reflector_at_hhmm=args.reflector_at,
+        heartbeat_interval_sec=args.heartbeat_interval,
+        llm_model=args.llm_model,
+        enable_trader=not args.no_trader,
+        enable_evolver=not args.no_evolver,
+        enable_reflector=not args.no_reflector,
+    )
+    op = Operator(config=cfg)
+
+    if args.max_runtime and args.max_runtime > 0:
+        import threading
+        stop = threading.Event()
+        timer = threading.Timer(args.max_runtime, stop.set)
+        timer.daemon = True
+        timer.start()
+        try:
+            op.run_until(stop)
+        finally:
+            timer.cancel()
+    else:
+        op.run_forever()
+    return 0
 
 
 if __name__ == "__main__":
