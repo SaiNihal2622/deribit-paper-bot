@@ -130,6 +130,7 @@ agent:
   evolver_interval_sec: 21600.0     # 6 hours
   reflector_at_hhmm: "00:05"        # daily, UTC
   heartbeat_interval_sec: 30.0
+  llm_probe_interval_sec: 3600.0    # 1 hour
   daily_token_limit: 500000
   daily_call_limit: 5000
   # Autonomy: low-risk evolver proposals are deployed automatically.
@@ -139,3 +140,51 @@ agent:
   # If true, the operator will fall back to rule-based decisions when the
   # LLM is unavailable or the daily budget is exhausted.
   fallback_enabled: true
+  # LLM provider chain. The router tries providers in order; the first
+  # that returns 200 wins and gets cached. Auth-failed providers are
+  # blacklisted for 30 minutes. Add your key(s) to .env; the env var
+  # name in `api_key_env` is what the router looks up.
+  #
+  # The MiniMax international public API at api.minimax.io accepts the
+  # Token Plan subscription key (`sk-cp-…`) directly with Bearer auth.
+  # The Mavis daemon proxy at agent.minimax.io/mavis/api/v1/llm/v1 is
+  # separate and only accepts session-bound tokens.
+  providers:
+    - name: minimax-international-anthropic
+      base_url: https://api.minimax.io/anthropic
+      model: MiniMax-M3
+      protocol: messages
+      auth: bearer
+      api_key_env: MINIMAX_API_KEY
+    - name: minimax-international-openai
+      base_url: https://api.minimax.io/v1
+      model: MiniMax-M3
+      protocol: chat-completions
+      auth: bearer
+      api_key_env: MINIMAX_API_KEY
+    - name: anthropic
+      base_url: https://api.anthropic.com
+      model: claude-3-5-haiku-20241022
+      protocol: messages
+      auth: x-api-key
+      api_key_env: ANTHROPIC_API_KEY
+      headers:
+        anthropic-version: "2023-06-01"
+    - name: openrouter
+      base_url: https://openrouter.ai/api/v1
+      model: openai/gpt-4o-mini
+      protocol: chat-completions
+      auth: bearer
+      api_key_env: OPENROUTER_API_KEY
+    - name: groq
+      base_url: https://api.groq.com/openai/v1
+      model: llama-3.1-8b-instant
+      protocol: chat-completions
+      auth: bearer
+      api_key_env: GROQ_API_KEY
+    - name: mistral
+      base_url: https://api.mistral.ai/v1
+      model: mistral-small-latest
+      protocol: chat-completions
+      auth: bearer
+      api_key_env: MISTRAL_API_KEY
