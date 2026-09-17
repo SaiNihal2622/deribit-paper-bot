@@ -252,6 +252,7 @@ class PaperRunner:
         dashboard=None,
         pnl_writer: Optional[_PnLWriter] = None,
         signal_log: Optional[_SignalLog] = None,
+        trader=None,                # NEW: optional Trader (agent layer) gate
     ):
         self.cfg = cfg
         self.feed_mode = feed_mode  # "ws" or "rest"
@@ -261,6 +262,7 @@ class PaperRunner:
         self.dashboard = dashboard  # optional DashboardServer
         self.pnl_writer = pnl_writer or _PnLWriter()
         self.signal_log = signal_log or _SignalLog()
+        self.trader = trader        # NEW: None = rule-based path only
         self._stop = threading.Event()
         self._last_heartbeat = 0.0
         self._cycle_count = 0
@@ -575,7 +577,15 @@ class PaperRunner:
         return ctx
 
     def _process_strategy(self, strategy, ctx, broker, feed, order_mgr, risk) -> None:
-        """Run one strategy against the current context. Place trades if eligible."""
+        """Run one strategy against the current context. Place trades if eligible.
+
+        Order of gates:
+        1. Strategy cooldown
+        2. Strategy eligibility + build_plan
+        3. Risk engine (hard rails — never overridable)
+        4. Trader LLM (discretionary veto / downsize — only if self.trader is set)
+        5. Execute
+        """
         name = strategy.name.value
         last = self._last_plan_at.get(name, 0.0)
         if time.time() - last < self._cooldown_sec:
@@ -656,8 +666,93 @@ class PaperRunner:
             strategy=name, underlying=ctx.underlying,
             status="accepted", reason=f"{plan.reason} | legs: {legs_summary}",
         )
+
+        # -----------------------------------------------------------
+        # Trader LLM gate (NEW)
+        # -----------------------------------------------------------
+        # The 5-strategy + risk-engine pipeline above is unchanged.
+        # This adds an OPTIONAL discretionary layer: the Trader asks
+        # the LLM whether to APPROVE / VETO / DOWNSIZE / HOLD this plan.
+        # Hard rails (risk engine caps) are already applied above; the
+        # Trader can only further restrict, never widen.
+        # -----------------------------------------------------------
+        target_qty = decision.suggested_qty
+        if self.trader is not None:
+            try:
+                from .agent.trader import TradeAction as _TradeAction  # local import
+                trader_decision = self.trader.decide_cycle(
+                    signal_context={
+                        "underlying": ctx.underlying,
+                        "spot": ctx.spot,
+                        "dvol": ctx.dvol,
+                        "iv_rank": ctx.iv_rank,
+                        "regime": ctx.regime,
+                        "momentum": getattr(ctx, "_momentum", 0.0),
+                        "timestamp": ctx.timestamp.isoformat() if ctx.timestamp else "",
+                    },
+                    candidate_plans=[{
+                        "strategy": name,
+                        "underlying": ctx.underlying,
+                        "reason": plan.reason,
+                        "target": plan.target,
+                        "stop": plan.stop,
+                        "legs": plan.legs,
+                        "risk_qty": decision.suggested_qty,
+                        "preset": decision.preset,
+                    }],
+                    account_state=account_state,
+                    health_summary={"bot_alive": True, "ws_subscribed": True},
+                )
+                act = trader_decision.action
+                # Map string or enum
+                act_str = act.value if hasattr(act, "value") else str(act)
+                rationale = trader_decision.rationale or ""
+                if act_str == _TradeAction.VETO.value:
+                    logger.warning(
+                        f"[{name}] TRADER.VETO: {rationale}  (risk would have APPROVED qty={decision.suggested_qty})"
+                    )
+                    self.signal_log.append(
+                        strategy=name, underlying=ctx.underlying,
+                        status="vetoed",
+                        reason=f"trader.llm.veto: {rationale[:200]}",
+                    )
+                    return  # do NOT execute
+                if act_str == _TradeAction.DOWNSIZE.value:
+                    new_qty = max(0, min(int(trader_decision.target_qty or 1), decision.suggested_qty))
+                    if new_qty < decision.suggested_qty:
+                        logger.warning(
+                            f"[{name}] TRADER.DOWNSIZE: {rationale}  (qty {decision.suggested_qty} -> {new_qty})"
+                        )
+                        self.signal_log.append(
+                            strategy=name, underlying=ctx.underlying,
+                            status="downsized",
+                            reason=f"trader.llm.downsize: qty={decision.suggested_qty}->{new_qty} | {rationale[:200]}",
+                        )
+                        target_qty = new_qty
+                    else:
+                        logger.info(f"[{name}] TRADER.APPROVE (downsize suggested but risk cap already at min): {rationale}")
+                        self.signal_log.append(
+                            strategy=name, underlying=ctx.underlying,
+                            status="approved",
+                            reason=f"trader.llm.approve (downsize-clamped): {rationale[:200]}",
+                        )
+                else:  # APPROVE or HOLD-as-approve
+                    logger.info(f"[{name}] TRADER.APPROVE: {rationale}")
+                    self.signal_log.append(
+                        strategy=name, underlying=ctx.underlying,
+                        status="approved",
+                        reason=f"trader.llm.approve: {rationale[:200]}",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"trader.decide_cycle failed; falling through to risk-approved: {exc}")
+                self.signal_log.append(
+                    strategy=name, underlying=ctx.underlying,
+                    status="approved",
+                    reason=f"trader.llm.unavailable (fallback to risk-approved): {str(exc)[:160]}",
+                )
+
         try:
-            order_mgr.execute_plan(plan, qty=decision.suggested_qty, expiry=expiry_iso)
+            order_mgr.execute_plan(plan, qty=target_qty, expiry=expiry_iso)
             self._last_plan_at[name] = time.time()
         except Exception as e:
             logger.exception(f"execute_plan failed: {e}")
@@ -846,6 +941,37 @@ class PaperRunner:
         self._feed = feed
         self._risk_ref = risk
 
+        # NEW: instantiate the Trader LLM gate if one wasn't passed in.
+        # The Trader gates every plan with a discretionary APPROVE /
+        # VETO / DOWNSIZE / HOLD decision from the configured LLM.
+        # `trader=False` from the CLI means explicitly disabled; leave
+        # as-is (rule-based path only).
+        if self.trader is None:
+            try:
+                from .agent.llm import LLMClient
+                from .agent.memory import Memory
+                from .agent.trader import Trader
+                from pathlib import Path
+                settings_path = Path("config/settings.yaml")
+                llm = LLMClient(settings_path=settings_path)
+                mem = Memory(root=Path("memory"))
+                self.trader = Trader(
+                    project_root=Path(".").resolve(),
+                    memory=mem,
+                    llm=llm,
+                    fallback_enabled=True,
+                )
+                logger.info(
+                    "Trader LLM gate ENABLED "
+                    f"(model={self.trader.model}, providers={len(llm.provider_status())})"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Trader LLM gate could not start ({exc}); rule-based path only")
+                self.trader = None
+        elif self.trader is False:
+            logger.info("Trader LLM gate DISABLED via --no-trader")
+            self.trader = None
+
         strategies = self._build_strategies()
         feed_url = getattr(feed, "ws_url", None) or getattr(feed, "base_url", "?")
         logger.info(
@@ -991,6 +1117,7 @@ def cmd_paper(args) -> int:
         cfg, feed_mode=feed_mode, verbose=verbose,
         mode="paper", alerter=alerter, dashboard=dashboard,
         pnl_writer=pnl_writer, signal_log=signal_log,
+        trader=False if getattr(args, "no_trader", False) else None,
     )
     if args.max_runtime:
         def _stop_after():
@@ -1061,6 +1188,7 @@ def cmd_live(args) -> int:
         cfg, feed_mode=feed_mode, verbose=bool(args.verbose),
         mode="live", alerter=alerter, dashboard=dashboard,
         pnl_writer=pnl_writer, signal_log=signal_log,
+        trader=False if getattr(args, "no_trader", False) else None,
     )
     if args.max_runtime:
         def _stop_after():
@@ -1148,12 +1276,20 @@ def main(argv: list[str] | None = None) -> int:
         "--dashboard-port", type=int, default=None,
         help="Start the dashboard on this port (default from config or 8511). 0 disables.",
     )
+    p_paper.add_argument(
+        "--no-trader", action="store_true",
+        help="Disable the Trader LLM gate; rule-based path only.",
+    )
     p_paper.set_defaults(func=cmd_paper)
 
     p_live = sub.add_parser("live", help="Run a LIVE trading session (safety guard required)")
     p_live.add_argument("--max-runtime", type=float, default=0.0)
     p_live.add_argument("--feed", choices=["ws", "rest"], default=None)
     p_live.add_argument("--verbose", action="store_true")
+    p_live.add_argument(
+        "--no-trader", action="store_true",
+        help="Disable the Trader LLM gate; rule-based path only.",
+    )
     p_live.add_argument("--dashboard-port", type=int, default=None)
     p_live.set_defaults(func=cmd_live)
 
