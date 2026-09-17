@@ -64,7 +64,7 @@ class TestOperator(unittest.TestCase):
         self.assertIsNotNone(op.trader)
         self.assertIsNotNone(op.evolver)
         self.assertIsNotNone(op.reflector)
-        self.assertEqual(len(op.scheduler.list_jobs()), 5)
+        self.assertEqual(len(op.scheduler.list_jobs()), 6)
 
     def test_runs_for_a_few_seconds(self) -> None:
         op = self._build()
@@ -87,7 +87,7 @@ class TestOperator(unittest.TestCase):
         op = self._build()
         s = op.status()
         self.assertIn("scheduler", s)
-        self.assertEqual(len(s["scheduler"]), 5)
+        self.assertEqual(len(s["scheduler"]), 6)
         self.assertIn("trader", s)
         self.assertIn("healer", s)
         self.assertIn("evolver", s)

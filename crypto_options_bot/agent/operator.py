@@ -60,6 +60,7 @@ class OperatorConfig:
     enable_trader: bool = True
     enable_evolver: bool = True
     enable_reflector: bool = True
+    llm_probe_interval_sec: float = 3600.0  # 1 hour
 
 
 @dataclass
@@ -76,6 +77,7 @@ class Operator:
     scheduler: Scheduler = field(default_factory=lambda: Scheduler(name="operator"))
     started_at: float = 0.0
     cycles: int = 0
+    _last_llm_probe_at: float = 0.0
 
     def __post_init__(self) -> None:
         self.config.project_root = Path(self.config.project_root).resolve()
@@ -86,7 +88,8 @@ class Operator:
 
         # Subsystems.
         self.memory = Memory(root=self.config.memory_dir)
-        self.llm = LLMClient()
+        settings_path = self.config.project_root / "config" / "settings.yaml"
+        self.llm = LLMClient(settings_path=settings_path)
         self.tools = ToolRegistry(memory=self.memory)
         self._register_tools()
 
@@ -142,6 +145,11 @@ class Operator:
             self._tick_heartbeat,
             every_sec=self.config.heartbeat_interval_sec,
         )
+        self.scheduler.add(
+            "llm_probe",
+            self._tick_llm_probe,
+            every_sec=self.config.llm_probe_interval_sec,
+        )
 
     # ------------------------------------------------------------------
     # Public
@@ -196,6 +204,8 @@ class Operator:
                 "last_lesson": str(self.reflector.last_lesson_path) if self.reflector.last_lesson_path else None,
             },
             "llm_budget": self.llm.budget_snapshot(),
+            "llm_providers": self.llm.provider_status(),
+            "llm_last_probe_at": self._last_llm_probe_at,
             "tools_recent": self.tools.recent_calls(5),
         }
 
@@ -243,6 +253,56 @@ class Operator:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
+
+    def _tick_llm_probe(self) -> None:
+        """Hourly: try every configured provider with a one-token call.
+
+        Surfaces which providers actually work, logs the result to the
+        memory journal so the user can see what to fix in .env. The next
+        Trader/ Evolver/ Reflector call picks up the freshly-validated
+        provider automatically.
+        """
+        self._last_llm_probe_at = time.time()
+        statuses = []
+        working = []
+        for st in self.llm.provider_status():
+            statuses.append(st)
+            if not st["key_present"] or st["dead_now"]:
+                continue
+            try:
+                resp = self.llm.messages(
+                    model=None,
+                    system="Reply with the single word OK.",
+                    messages=[{"role": "user", "content": "OK"}],
+                    max_tokens=4,
+                    provider=st["name"],
+                )
+                working.append(
+                    {"provider": st["name"], "ok": True, "text": resp.text[:40]}
+                )
+            except Exception as exc:  # noqa: BLE001
+                working.append(
+                    {"provider": st["name"], "ok": False, "error": str(exc)[:200]}
+                )
+        self.memory.write_state(
+            "llm_probe:latest",
+            {"ts": time.time(), "providers": statuses, "results": working},
+        )
+        ok_count = sum(1 for r in working if r["ok"])
+        log.info("llm_probe: %d/%d providers working", ok_count, len(working))
+        if ok_count == 0:
+            self.memory.append_journal(
+                "operator",
+                "LLM probe: NO provider authenticating. "
+                "Edit .env to set a valid key (try MINIMAX_API_KEY, "
+                "ANTHROPIC_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, "
+                "or MISTRAL_API_KEY). The next call will retry automatically.",
+            )
+        elif ok_count == 1:
+            self.memory.append_journal(
+                "operator",
+                f"LLM probe: routed through '{working[0]['provider']}'",
+            )
 
     # ------------------------------------------------------------------
     # Tools registered for the LLM layer
