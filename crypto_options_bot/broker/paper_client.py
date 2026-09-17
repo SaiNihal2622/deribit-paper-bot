@@ -274,36 +274,49 @@ class PaperClient(BrokerClient):
         tick = self._ticks.get(order.symbol)
         if not tick:
             return
-        order.expected_fill_price = tick.ltp
+        # If the raw tick has ltp=0 (testnet strikes with no orders),
+        # synthesise a price from the order's own price or from a small
+        # fallback so we don't divide-by-zero or fill at 0. The signal
+        # context uses Black-Scholes for the strategy layer; here we
+        # just need ANY positive number for the limit-fill math.
+        if tick.ltp <= 0 and order.price > 0:
+            tick = tick  # keep the symbol reference
+            # Use the order's limit price as the implied ref ltp (it was
+            # built from BS theory by the strategy). The math below
+            # compares order.price to tick.ltp — substitute tick.ltp
+            # with order.price when tick.ltp is 0.
+        order.expected_fill_price = tick.ltp if tick.ltp > 0 else order.price
+        # Effective reference price for all comparisons in this method.
+        ref_price = tick.ltp if tick.ltp > 0 else order.price
         fill_price = 0.0
         if order.order_type == OrderType.MARKET:
-            slip = tick.ltp * (self.slippage_bps / 10_000)
-            fill_price = tick.ltp + (slip if order.side == OrderSide.BUY else -slip)
+            slip = ref_price * (self.slippage_bps / 10_000)
+            fill_price = ref_price + (slip if order.side == OrderSide.BUY else -slip)
         elif order.order_type == OrderType.LIMIT:
             spread = max(
                 self.limit_fill_min_spread,
-                tick.ltp * (self.limit_fill_spread_pct / 100.0),
+                ref_price * (self.limit_fill_spread_pct / 100.0),
             )
-            synthetic_bid = tick.ltp - spread
-            synthetic_ask = tick.ltp + spread
+            synthetic_bid = ref_price - spread
+            synthetic_ask = ref_price + spread
             if order.side == OrderSide.BUY:
                 if order.price >= synthetic_ask:
                     fill_price = min(order.price, synthetic_ask)
-                elif abs(order.price - tick.ltp) / tick.ltp < (self.limit_fill_near_ltp_pct / 100.0):
+                elif ref_price > 0 and abs(order.price - ref_price) / ref_price < (self.limit_fill_near_ltp_pct / 100.0):
                     fill_price = order.price
             elif order.side == OrderSide.SELL:
                 if order.price <= synthetic_bid:
                     fill_price = max(order.price, synthetic_bid)
-                elif abs(order.price - tick.ltp) / tick.ltp < (self.limit_fill_near_ltp_pct / 100.0):
+                elif ref_price > 0 and abs(order.price - ref_price) / ref_price < (self.limit_fill_near_ltp_pct / 100.0):
                     fill_price = order.price
         elif order.order_type == OrderType.SL:
-            if (order.side == OrderSide.BUY and tick.ltp >= order.trigger_price) or \
-               (order.side == OrderSide.SELL and tick.ltp <= order.trigger_price):
-                fill_price = order.price if order.price > 0 else tick.ltp
+            if (order.side == OrderSide.BUY and ref_price >= order.trigger_price) or \
+               (order.side == OrderSide.SELL and ref_price <= order.trigger_price):
+                fill_price = order.price if order.price > 0 else ref_price
         elif order.order_type == OrderType.SL_M:
-            if (order.side == OrderSide.BUY and tick.ltp >= order.trigger_price) or \
-               (order.side == OrderSide.SELL and tick.ltp <= order.trigger_price):
-                fill_price = tick.ltp
+            if (order.side == OrderSide.BUY and ref_price >= order.trigger_price) or \
+               (order.side == OrderSide.SELL and ref_price <= order.trigger_price):
+                fill_price = ref_price
         if fill_price > 0:
             order.avg_fill_price = round(fill_price, 4)
             order.filled_qty = order.qty

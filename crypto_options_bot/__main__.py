@@ -496,17 +496,72 @@ class PaperRunner:
         strikes = sorted(oi_map.keys())
         option_ltps: dict = {}
         option_ivs: dict = {}
+        # Count strikes whose IV we know but LTP is missing on testnet.
+        # Without this fix, the strategies silently return None because
+        # `option_ltps.get((strike, "C"/"P"), 0.0)` returns 0 for every
+        # unquoted option. Black-Scholes theoretical price (using the
+        # real mark_iv the feed publishes) gives us a usable synthetic
+        # price so the strategy can build a plan.
+        synth_count = 0
+        # Compute TTE for BS in years (assume nearest expiry).
+        _days_to_expiry = 0.0
+        try:
+            _ddmmyy = feed.get_nearest_expiry(underlying)
+            if _ddmmyy and len(_ddmmyy) >= 7:
+                _d = int(_ddmmyy[0:2])
+                _MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                           "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+                _m = _MONTHS[_ddmmyy[2:5]]
+                _y = 2000 + int(_ddmmyy[5:7])
+                _exp_date = date(_y, _m, _d)
+                _days_to_expiry = max(0.0, (_exp_date - datetime.now(timezone.utc).date()).days)
+        except Exception:
+            pass
+        _tte_years = max(_days_to_expiry, 1.0) / 365.0  # floor 1 day to avoid degenerate TTE
         for s in strikes:
             ce = oi_map[s].get("ce_ltp", 0.0)
             pe = oi_map[s].get("pe_ltp", 0.0)
             ce_iv = oi_map[s].get("ce_iv", 0.0)
             pe_iv = oi_map[s].get("pe_iv", 0.0)
+            # Call side.
             if ce > 0:
                 option_ltps[(s, "C")] = ce
                 option_ivs[(s, "C")] = ce_iv
+            elif ce_iv > 0:
+                # Synthesize LTP from BS theoretical price using the
+                # mark_iv the feed publishes.
+                try:
+                    from .risk.greeks import bs_greeks
+                    g = bs_greeks(spot=spot, strike=float(s),
+                                  time_to_expiry_years=_tte_years, vol=ce_iv,
+                                  option_type="C")
+                    if g.price > 0:
+                        option_ltps[(s, "C")] = g.price
+                        option_ivs[(s, "C")] = ce_iv
+                        synth_count += 1
+                except Exception:
+                    pass
+            # Put side.
             if pe > 0:
                 option_ltps[(s, "P")] = pe
                 option_ivs[(s, "P")] = pe_iv
+            elif pe_iv > 0:
+                try:
+                    from .risk.greeks import bs_greeks
+                    g = bs_greeks(spot=spot, strike=float(s),
+                                  time_to_expiry_years=_tte_years, vol=pe_iv,
+                                  option_type="P")
+                    if g.price > 0:
+                        option_ltps[(s, "P")] = g.price
+                        option_ivs[(s, "P")] = pe_iv
+                        synth_count += 1
+                except Exception:
+                    pass
+        if synth_count > 0:
+            logger.debug(
+                f"[{underlying}] synthesized {synth_count} option prices via Black-Scholes "
+                f"(testnet had bid=0/ask=0 but mark_iv is real)"
+            )
         atm = feed.get_atm_strike(underlying)
         atm_iv = 0.0
         if atm:
