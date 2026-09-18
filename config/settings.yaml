@@ -16,7 +16,7 @@ broker:
 
 data:
   feed_mode: ws                # 'ws' (real-time WebSocket) or 'rest' (2s REST polling)
-  deribit_env: testnet         # 'testnet' or 'prod'
+  deribit_env: prod            # 'testnet' or 'prod' (was testnet; flipped 2026-09-18 for mainnet paper-trading)
   currencies: [BTC, ETH]
   poll_interval_sec: 2.0       # used by the REST fallback feed
   strike_window_pct: 0.20      # emit strikes within +/-20% of spot
