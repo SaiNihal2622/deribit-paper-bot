@@ -147,6 +147,42 @@ def collect_checks() -> list[dict]:
 
     # 1. env vars
     for env_name in REQUIRED_ENV_VARS:
+        # DERIBIT_LIVE_CONFIRMED is special: it's a safety guard. It must be
+        # YES for live trading but NO is the intentional safe default while
+        # we're in paper-on-mainnet. Report PASS/INFO accordingly.
+        is_safety_guard = env_name == "DERIBIT_LIVE_CONFIRMED"
+        if is_safety_guard:
+            raw = (
+                os.environ.get(env_name)
+                or _load_dotenv().get(env_name)
+                or ""
+            )
+            if raw.strip().upper() == "YES":
+                status = "PASS"
+                detail = "YES (live trading authorized)"
+            elif raw.strip().upper() == "NO":
+                status = "INFO"
+                detail = "NO (safe default — paper trading only)"
+            elif raw == "":
+                status = "FAIL"
+                detail = "NOT SET — required even for paper if you want the guard explicit"
+            else:
+                status = "FAIL"
+                detail = f"set to '{raw}' (must be YES to go live, NO otherwise)"
+            checks.append({
+                "id": f"env.{env_name}",
+                "category": "env",
+                "description": f"Environment variable {env_name} (safety guard)",
+                "status": status,
+                "detail": detail,
+                "required": True,
+                "fix": (
+                    "Set to YES only when you're ready to risk real money."
+                    if status == "FAIL"
+                    else None
+                ),
+            })
+            continue
         ok, detail = _check_env(env_name, None)
         checks.append({
             "id": f"env.{env_name}",

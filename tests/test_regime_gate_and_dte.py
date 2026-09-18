@@ -245,6 +245,10 @@ class TestMainnetReadiness:
         # Clear any user env vars so we get a clean failure.
         for var in mnr.REQUIRED_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
+        # The script also consults .env — mock that to empty so the
+        # safety-guard check sees a true missing value rather than
+        # whatever happens to be in .env.
+        monkeypatch.setattr(mnr, "_load_dotenv", lambda: {})
         checks = mnr.collect_checks()
         env_checks = [c for c in checks if c["category"] == "env"]
         assert all(c["status"] == "FAIL" for c in env_checks)
@@ -260,6 +264,7 @@ class TestMainnetReadiness:
     def test_json_output_is_valid(self, monkeypatch, capsys):
         for var in mnr.REQUIRED_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(mnr, "_load_dotenv", lambda: {})
         # Invoke the main entry point with --json
         monkeypatch.setattr(sys, "argv", ["mainnet_readiness", "--json"])
         rc = mnr.main()
