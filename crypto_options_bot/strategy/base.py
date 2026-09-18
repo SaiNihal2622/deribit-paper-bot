@@ -18,6 +18,7 @@ class StrategyName(str, Enum):
     DIRECTIONAL_DEBIT = "directional_debit"
     IRON_CONDOR = "iron_condor"
     SHORT_STRANGLE = "short_strangle"
+    SHORT_CALL = "short_call"
     CALENDAR_SPREAD = "calendar_spread"
     LONG_STRADDLE = "long_straddle"
 

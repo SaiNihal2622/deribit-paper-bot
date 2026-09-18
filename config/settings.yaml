@@ -83,6 +83,15 @@ strategy:
     stop_loss_multiplier: 2.0
     min_iv_rank: 50            # NEW: configurable (was hard-coded 50)
     max_dvol: 80.0             # NEW: configurable (was hard-coded 80)
+  # NEW: single-leg short call for testnet where put liquidity is broken.
+  # Uses only the call side; works on real bid/ask quotes.
+  short_call:
+    target_delta: 0.20
+    profit_target_pct: 50
+    stop_loss_multiplier: 2.0
+    min_iv_rank: 50
+    max_dvol: 80.0
+    wing_atm_mult: 0.05
   directional_debit:           # NEW strategy: single-leg long option
     min_momentum: 0.02
     min_iv_rank: 20.0

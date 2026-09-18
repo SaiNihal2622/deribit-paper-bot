@@ -74,6 +74,7 @@ from .risk.engine import RiskEngine
 from .strategy.base import SignalContext, StrategyName, TradePlan
 from .strategy.iron_condor import IronCondorStrategy
 from .strategy.short_strangle import ShortStrangleStrategy
+from .strategy.short_call import ShortCallStrategy
 from .strategy.directional_debit import DirectionalDebitStrategy
 from .strategy.calendar_spread import CalendarSpreadStrategy
 from .strategy.long_straddle import LongStraddleStrategy
@@ -477,6 +478,8 @@ class PaperRunner:
             strategies.append(IronCondorStrategy(strat_cfg.get("iron_condor", {})))
         if "short_strangle" in strat_cfg:
             strategies.append(ShortStrangleStrategy(strat_cfg.get("short_strangle", {})))
+        if "short_call" in strat_cfg:
+            strategies.append(ShortCallStrategy(strat_cfg.get("short_call", {})))
         if "directional_debit" in strat_cfg:
             strategies.append(DirectionalDebitStrategy(strat_cfg.get("directional_debit", {})))
         if "calendar_spread" in strat_cfg:
@@ -496,91 +499,27 @@ class PaperRunner:
         strikes = sorted(oi_map.keys())
         option_ltps: dict = {}
         option_ivs: dict = {}
-        # Count strikes whose IV we know but LTP is missing on testnet.
-        # Without this fix, the strategies silently return None because
-        # `option_ltps.get((strike, "C"/"P"), 0.0)` returns 0 for every
-        # unquoted option. Black-Scholes theoretical price (using the
-        # real mark_iv the feed publishes) gives us a usable synthetic
-        # price so the strategy can build a plan.
-        synth_count = 0
-        # Compute TTE for BS in years (assume nearest expiry).
-        # Use HOURS not days, because floor-1-day overstates TTE for
-        # options expiring later today and gives ~3x inflated synthetic
-        # prices (e.g. 1-day floor returns ~$53 for a BTC OTM put when
-        # the actual 5-hour TTE is ~$13).
-        _hours_to_expiry = 24.0  # default to 1 day if we can't parse
-        try:
-            _ddmmyy = feed.get_nearest_expiry(underlying)
-            # get_nearest_expiry may return either ISO ("2026-09-18")
-            # or DDMMMYY ("18SEP26") depending on version. Detect both.
-            if _ddmmyy:
-                if len(_ddmmyy) == 10 and _ddmmyy[4] == "-":  # YYYY-MM-DD
-                    _exp_date = date.fromisoformat(_ddmmyy)
-                    _hours_to_expiry = max(1.0,
-                        (_exp_date - datetime.now(timezone.utc).date()).days * 24.0)
-                elif len(_ddmmyy) >= 7:  # DDMMMYY
-                    _d = int(_ddmmyy[0:2])
-                    _MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
-                               "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-                    _m = _MONTHS[_ddmmyy[2:5]]
-                    _y = 2000 + int(_ddmmyy[5:7])
-                    _exp_date = date(_y, _m, _d)
-                    _hours_to_expiry = max(1.0,
-                        (_exp_date - datetime.now(timezone.utc).date()).days * 24.0)
-        except Exception:
-            pass
-        _tte_years = _hours_to_expiry / (24.0 * 365.0)
+        # Strategy uses REAL bid/ask-derived prices only. The previous
+        # "fall back to BS synthetic" path produced prices that looked
+        # real but were actually for stale quotes — the Trader LLM
+        # correctly identified them as broken data and VETOED every
+        # cycle. The only path to real trades is to require REAL
+        # bid/ask quotes for the legs we use.
         for s in strikes:
             ce = oi_map[s].get("ce_ltp", 0.0)
             pe = oi_map[s].get("pe_ltp", 0.0)
             ce_iv = oi_map[s].get("ce_iv", 0.0)
             pe_iv = oi_map[s].get("pe_iv", 0.0)
-            # Call side.
+            # Only include legs with a real (non-zero) last-price. This
+            # filters out testnet strikes with bid=0/ask=0.0001 that
+            # would otherwise trick the strategy into thinking the
+            # option is genuinely at $0.
             if ce > 0:
                 option_ltps[(s, "C")] = ce
                 option_ivs[(s, "C")] = ce_iv
-            elif ce_iv > 0:
-                # Synthesize LTP from BS theoretical price using the
-                # mark_iv the feed publishes.
-                try:
-                    from .risk.greeks import bs_greeks
-                    g = bs_greeks(spot=spot, strike=float(s),
-                                  time_to_expiry_years=_tte_years, vol=ce_iv,
-                                  option_type="C")
-                    if g.price > 0:
-                        option_ltps[(s, "C")] = g.price
-                        option_ivs[(s, "C")] = ce_iv
-                        synth_count += 1
-                except Exception:
-                    pass
-            # Put side.
             if pe > 0:
                 option_ltps[(s, "P")] = pe
                 option_ivs[(s, "P")] = pe_iv
-            elif pe_iv > 0:
-                try:
-                    from .risk.greeks import bs_greeks
-                    g = bs_greeks(spot=spot, strike=float(s),
-                                  time_to_expiry_years=_tte_years, vol=pe_iv,
-                                  option_type="P")
-                    if g.price > 0:
-                        option_ltps[(s, "P")] = g.price
-                        option_ivs[(s, "P")] = pe_iv
-                        synth_count += 1
-                except Exception:
-                    pass
-        if synth_count > 0:
-            logger.debug(
-                f"[{underlying}] synthesized {synth_count} option prices via Black-Scholes "
-                f"(testnet had bid=0/ask=0 but mark_iv is real)"
-            )
-            # DEBUG: dump first 5 synthetic prices so we can verify they look sane.
-            for (s2, ot), price in list(option_ltps.items())[:6]:
-                if ot == "P":
-                    iv_used = option_ivs.get((s2, ot), 0.0)
-                    logger.info(
-                        f"  [DEBUG] {underlying} {ot} K={s2} synth={price:.4f} iv={iv_used:.3f} spot={spot:.0f}"
-                    )
         atm = feed.get_atm_strike(underlying)
         atm_iv = 0.0
         if atm:
