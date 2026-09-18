@@ -1,8 +1,8 @@
 # Install Windows Task Scheduler entries for crypto-options-bot.
-# Creates two tasks (no admin required for current-user tasks):
-#   - CryptoOptionsBot\Heartbeat  : every 5 min, runs heartbeat.ps1
-#   - CryptoOptionsBot\Watchdog   : at logon, runs watchdog.ps1
-#   - CryptoOptionsBot\DailyReset : daily 00:05, runs daily_reset.ps1
+# Creates three user-level tasks (no admin required):
+#   - CryptoOptionsBotWatchdog   : at logon, monitors + auto-restarts bot
+#   - CryptoOptionsBotHeartbeat  : every 5 min, logs health snapshot
+#   - CryptoOptionsBotDailyReset : daily 00:05, archives logs
 #
 # Usage:  .\install_scheduled_tasks.ps1
 #         .\install_scheduled_tasks.ps1 -Uninstall
@@ -15,55 +15,90 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProjectDir = "C:\Users\saini\.minimax-agent\projects\crypto-options-bot"
-$TaskFolder = "\CryptoOptionsBot"
 
-function Remove-FolderIfEmpty {
-    param([string]$Path)
-    $f = Get-ScheduledTask -TaskPath $Path -ErrorAction SilentlyContinue
-    if ($null -eq $f) {
-        # try removing folder
-        $null = schtasks /Delete /TN "${Path}\__noop" /F 2>&1
-    }
-}
+# Task names are namespaced to avoid collisions with anything else
+$WatchdogName  = "CryptoOptionsBotWatchdog"
+$HeartbeatName = "CryptoOptionsBotHeartbeat"
+$DailyName     = "CryptoOptionsBotDailyReset"
+$AllTasks = @($WatchdogName, $HeartbeatName, $DailyName)
 
 if ($Uninstall) {
-    Write-Host "Uninstalling scheduled tasks under $TaskFolder ..."
-    $tasks = Get-ScheduledTask -TaskPath $TaskFolder -ErrorAction SilentlyContinue
-    if ($tasks) {
-        foreach ($t in $tasks) {
-            Write-Host "  removing $($t.TaskName)"
-            Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false
+    Write-Host "Uninstalling scheduled tasks..."
+    foreach ($name in $AllTasks) {
+        $t = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        if ($t) {
+            Unregister-ScheduledTask -TaskName $name -Confirm:$false
+            Write-Host "  removed: $name"
+        } else {
+            Write-Host "  not found: $name"
         }
-    } else {
-        Write-Host "  no tasks found"
     }
     Write-Host "Done."
     exit 0
 }
 
-# Create folder
-$null = schtasks /Create /SC ONCE /TN "${TaskFolder}\__noop" /TR "cmd /c exit 0" /ST 00:00 /F 2>&1
-$null = Unregister-ScheduledTask -TaskName "__noop" -TaskPath $TaskFolder -Confirm:$false -ErrorAction SilentlyContinue
+# Helper: register a task. Falls back gracefully if the registration fails
+# (e.g., no admin, missing privilege).
+function Install-Task {
+    param(
+        [string]$Name,
+        [string]$ScriptRelative,
+        [string]$TriggerSpec,    # "atlogon" | "every5min" | "every1min" | "daily0005"
+        [string]$Description
+    )
+    $scriptPath = Join-Path $ProjectDir $ScriptRelative
+    if (-not (Test-Path $scriptPath)) {
+        Write-Warning "  SKIP $Name (script not found: $scriptPath)"
+        return $false
+    }
 
-# 1) Watchdog at logon
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ProjectDir\watchdog.ps1`"" -WorkingDirectory $ProjectDir
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName "Watchdog" -TaskPath $TaskFolder -Action $action -Trigger $trigger -Settings $settings -Description "Crypto-options-bot watchdog: monitors bot + dashboard, auto-restarts" -Force | Out-Null
-Write-Host "  installed: ${TaskFolder}\Watchdog  (at logon)"
+    $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arg -WorkingDirectory $ProjectDir
+    switch ($TriggerSpec) {
+        "atlogon"   { $trigger = New-ScheduledTaskTrigger -AtLogOn }
+        "every5min" {
+            $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+                -RepetitionInterval (New-TimeSpan -Minutes 5) `
+                -RepetitionDuration (New-TimeSpan -Days 3650)
+        }
+        "every1min" {
+            # Watchdog runs every 1 min for tight crash recovery without
+            # admin (AtLogOn triggers need elevation).
+            $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+                -RepetitionInterval (New-TimeSpan -Minutes 1) `
+                -RepetitionDuration (New-TimeSpan -Days 3650)
+        }
+        "daily0005" { $trigger = New-ScheduledTaskTrigger -Daily -At "00:05" }
+        default     { throw "unknown trigger spec: $TriggerSpec" }
+    }
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
-# 2) Heartbeat every 5 min
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ProjectDir\heartbeat.ps1`" >> `"$ProjectDir\logs\heartbeat.out.log`" 2>&1" -WorkingDirectory $ProjectDir
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName "Heartbeat" -TaskPath $TaskFolder -Action $action -Trigger $trigger -Settings $settings -Description "Crypto-options-bot heartbeat: every 5 min health check + log scan" -Force | Out-Null
-Write-Host "  installed: ${TaskFolder}\Heartbeat  (every 5 min)"
+    try {
+        # Remove existing first so we don't fight with prior runs.
+        Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue
+        Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Settings $settings -Description $Description -Force | Out-Null
+        Write-Host "  installed: $Name ($TriggerSpec)"
+        return $true
+    } catch {
+        Write-Warning "  FAILED $Name - $($_.Exception.Message)"
+        return $false
+    }
+}
 
-# 3) Daily reset at 00:05
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$ProjectDir\daily_reset.ps1`" >> `"$ProjectDir\logs\daily_reset.out.log`" 2>&1" -WorkingDirectory $ProjectDir
-$trigger = New-ScheduledTaskTrigger -Daily -At "00:05"
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName "DailyReset" -TaskPath $TaskFolder -Action $action -Trigger $trigger -Settings $settings -Description "Crypto-options-bot daily housekeeping: archive CSVs, rotate large logs" -Force | Out-Null
-Write-Host "  installed: ${TaskFolder}\DailyReset  (daily 00:05)"
+Write-Host "Installing scheduled tasks under user context..."
+$ok = $true
+# Watchdog: every-1-min repeating trigger. Survives reboot (Task Scheduler
+# starts it within ~60s of machine boot) AND auto-restarts the bot if it
+# dies. Same effect as AtLogOn but doesn't require admin.
+$ok = (Install-Task -Name $WatchdogName -ScriptRelative "watchdog.ps1" -TriggerSpec "every1min" -Description "Crypto-options-bot watchdog: monitors bot + dashboard, auto-restarts every minute") -and $ok
+$ok = (Install-Task -Name $HeartbeatName -ScriptRelative "heartbeat.ps1" -TriggerSpec "every5min" -Description "Crypto-options-bot heartbeat: every 5 min health check + log scan") -and $ok
+$ok = (Install-Task -Name $DailyName -ScriptRelative "daily_reset.ps1" -TriggerSpec "daily0005" -Description "Crypto-options-bot daily housekeeping: archive CSVs, rotate large logs") -and $ok
 
-Write-Host "Done. View with: Get-ScheduledTask -TaskPath $TaskFolder"
+Write-Host ""
+if ($ok) {
+    Write-Host "All 3 scheduled tasks installed."
+    Write-Host "Verify with: Get-ScheduledTask -TaskName CryptoOptionsBot*"
+} else {
+    Write-Host "Some tasks failed. Verify with: Get-ScheduledTask -TaskName CryptoOptionsBot*"
+    Write-Host "Re-run from an elevated (admin) PowerShell if you see access-denied errors."
+}

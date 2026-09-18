@@ -22,18 +22,19 @@ if (-not (Test-Path $logDir)) {
 
 Write-WLog ("=== Watchdog started (PID " + $PID + ") ===")
 Write-WLog ("Project: " + $project)
-Write-WLog "Will check every 60s, restart bot/dashboard if dead"
+Write-WLog "Will check every 60s, restart bot/dashboard/operator if dead"
 
 $checkIntervalSec     = 60
 $restartCooldownSec   = 30
 $lastBotRestart       = (Get-Date).AddSeconds(-$restartCooldownSec - 1)
+$lastOperatorRestart  = (Get-Date).AddSeconds(-$restartCooldownSec - 1)
 $lastDashRestart      = (Get-Date).AddSeconds(-$restartCooldownSec - 1)
 $DashboardPort        = 8511
 
 while ($true) {
     try {
-        # ---- bot process check ----
-        $botProcs = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'crypto_options_bot' })
+        # ---- bot process check (paper/live mode, NOT operator) ----
+        $botProcs = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'crypto_options_bot\s+(paper|live)' })
         $botAlive = ($botProcs.Count -gt 0)
 
         if (-not $botAlive) {
@@ -51,6 +52,28 @@ while ($true) {
                 }
             } else {
                 Write-WLog ("Bot dead but within cooldown (" + [int]$sinceLast + "s), skipping")
+            }
+        }
+
+        # ---- operator process check ----
+        $opProcs = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'crypto_options_bot\s+operator' })
+        $opAlive = ($opProcs.Count -gt 0)
+
+        if (-not $opAlive) {
+            $now = Get-Date
+            $sinceLast = ($now - $lastOperatorRestart).TotalSeconds
+            if ($sinceLast -ge $restartCooldownSec) {
+                Write-WLog "ALERT: operator DEAD - invoking scripts/start_operator.ps1"
+                try {
+                    $out = & "$project\scripts\start_operator.ps1" 2>&1
+                    Write-WLog ("  start_operator.ps1 invoked (" + @($out).Count + " lines)")
+                    $lastOperatorRestart = $now
+                    Start-Sleep -Seconds 10
+                } catch {
+                    Write-WLog ("  ERROR: " + $_.ToString())
+                }
+            } else {
+                Write-WLog ("Operator dead but within cooldown (" + [int]$sinceLast + "s), skipping")
             }
         }
 
