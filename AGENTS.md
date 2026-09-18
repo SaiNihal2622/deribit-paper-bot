@@ -108,10 +108,13 @@ trade.
 
 - **Tests:** `pytest -q` → `156 passed, 1 skipped` (the skip is `test_at_hhmm_wall_clock` — covered deterministically by `test_at_hhmm_computes_next_occurrence`).
 - **Branch:** `main`. Local HEAD ahead of `origin/main` by 9 commits pending this push.
-- **Bot process:** currently running (PID was 19716 at 14:10 IST, started 2026-09-18 with new regime-gate config). Open trades: 6. WS channels: 58.
-- **Operator process:** running (PID 19664).
-- **DVOL right now:** BTC ~34 (gate engaged, blocks BTC trades), ETH ~50 (gate engaged, blocks ETH trades). Bot logs `REGIME GATE closed for {cur}` once per currency per cycle.
-- **Mainnet:** still on testnet. User must supply `DERIBIT_CLIENT_ID` + `DERIBIT_CLIENT_SECRET` + flip `DERIBIT_LIVE_CONFIRMED=YES` + change `data.deribit_env: testnet` → `prod`. See §3b.
+- **NSSM services:** ✅ Both running. `CryptoOptionsBot` and `CryptoOptionsOperator` registered as Automatic-start Windows services. Bot parent PID = nssm.exe (PIDs 4952/5052/13036 etc.). Dashboard at http://127.0.0.1:8511/ responds.
+- **Watchdog scheduled task:** Disabled. With NSSM running the bot, watchdog is redundant and would race for port 8511. Keep disabled.
+- **Bot:** running on mainnet (wss://www.deribit.com), 50+ WS channels, $100k paper capital clean, 0 trades (regime gate engaged due to DVOL=35 BTC / 51 ETH, both below 50/55 thresholds).
+- **Operator:** running. All 6 agent jobs active (sentinel, healer, evolver, reflector, heartbeat, llm_probe). 0 errors.
+- **DVOL right now:** BTC=35, ETH=51 (real mainnet readings). Bot logs `REGIME GATE closed for {cur}` once per currency per ~5min cycle.
+- **Mainnet:** ✅ Active. Credentials in `.env` (Deribit key name `cryptooptionsbot`, scopes trade:read_write + account:read_write). Bot reads real mainnet quotes via WS. Order placement is simulated by PaperClient — for real trading also flip `DERIBIT_LIVE_CONFIRMED=YES` in `.env`. See §3b.
+- **Critical system-wide Python deps** (required for NSSM to launch bot successfully as LocalSystem): `pyyaml`, `loguru`, `colorama`, `pywin32`/`win32-setctime`, `websocket-client`, `python-dotenv`, `httpx`. If you reinstall Python or move to a new machine, run `pip install --upgrade pyyaml loguru colorama pywin32 win32-setctime websocket-client python-dotenv httpx pytest` from an **elevated** PowerShell.
 
 ---
 
