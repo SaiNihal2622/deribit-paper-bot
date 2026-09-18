@@ -55,15 +55,63 @@ LLM prompts are versioned in `crypto_options_bot/agent/prompts/` as Markdown. Al
 
 ---
 
-## 4. State-of-the-world snapshot (last verified 2026-09-17)
+## 3a. Profitability gates (NEW 2026-09-18)
 
-- **Tests:** `pytest -q` → `119 passed, 1 skipped` (the skip is `test_at_hhmm_wall_clock` — covered deterministically by `test_at_hhmm_computes_next_occurrence`).
-- **Branch:** `main`. Last push `276a2eb`. Local HEAD matches `origin/main`.
-- **Remote URL:** contains the GitHub PAT inline. **The PAT must be considered exposed** (it was used by the previous session). Recommend the user revoke it ASAP via GitHub Settings → Developer settings → PATs.
-- **Repo visibility:** currently **public** (was created private; toggled by someone). Recommend re-flipping to private.
-- **Bot process:** not currently running. Start with `.\start_bot_detached.ps1` (no admin) or `.\start_bot_service.ps1 install` (admin, NSSM).
-- **Operator process:** not currently running. Start with `.\scripts\start_operator.ps1` (no admin) or `.\start_bot_service.ps1 install-operator` (admin, NSSM).
-- **`MINIMAX_API_KEY`:** not set. `.env.example` has placeholders only. Without the key, the LLM client fails open with a `LLMError` and the agents fall back to rule-based decisions.
+Three settings in `config/settings.yaml` work together to make the bot trade
+only when there's actual edge. They are *not* hardcoded — they live in config
+so the user can tune them.
+
+| Gate | Setting | Default | What it does |
+|---|---|---|---|
+| **IV regime** | `data.iv_regime_gate.{BTC,ETH}.{min_dvol,min_iv_rank}` | BTC: DVOL≥50, iv_rank≥40 / ETH: DVOL≥55, iv_rank≥45 | Skip all strategies on a currency when its DVOL is too low to make short premium profitable. Logs once every 5 min so it doesn't spam. |
+| **Min DTE** | `data.min_dte_to_trade` | `2` | Skip strikes whose expiry is < 2 days out. No theta runway = no edge. Wired into both the WS feed (drops 0DTE/1DTE expiries from subscription) and the `short_call` strategy (rejects plans on near-dated legs). |
+| **Wider universe** | `data.ws.expiry_count` + `data.ws.max_strikes_per_expiry` | `5` expiries × `5` strikes | Push the universe beyond the same-day weekly. Bot now subscribes to today + 4 future expiries (weeklies + monthlies) so it can find liquid quotes further out the curve. |
+
+When DVOL is mid (BTC ~34, ETH ~50 today), the regime gate closes and
+the bot logs `REGIME GATE closed for BTC: dvol=34<50. Waiting for vol to
+recover (no trades)`. The position state, open trades, and operator
+keep running — only new entries are paused.
+
+---
+
+## 3b. Going to mainnet (live trading on real Deribit)
+
+Paper trading uses Deribit **testnet**, which has thin liquidity on
+OTM strikes (puts especially). To flip to real-money mainnet:
+
+1. Create a Deribit mainnet API key at https://www.deribit.com/ →
+   Account → API → Create New Key (scope: `trade` + `read`).
+2. Set three env vars in `.env`:
+   ```
+   DERIBIT_CLIENT_ID=<api_key>
+   DERIBIT_CLIENT_SECRET=<api_secret>
+   DERIBIT_LIVE_CONFIRMED=YES
+   ```
+3. Edit `config/settings.yaml`: change `data.deribit_env: testnet` → `prod`.
+4. Stop the bot: `Stop-Process` on `bot.pid` (or `nssm stop KotakBotPaper`).
+5. Restart: `powershell -File start_bot_detached.ps1` (or `nssm start`).
+6. Verify: `python -m crypto_options_bot status` (look for `feed=DeribitWebSocketFeed` with `env=prod`).
+
+`scripts/mainnet_readiness.py` automates step 0 — it prints what's
+missing and gives you the exact `FIX` line for each blocker. Run it any
+time before going live.
+
+**Safety guarantee:** the bot refuses to start in `live` mode unless
+`DERIBIT_LIVE_CONFIRMED=YES`. This is enforced by `DeribitSafetyError`
+in `broker/deribit_client.py`. Setting `KOTAK_ENV=prod` without
+`DERIBIT_LIVE_CONFIRMED=YES` will raise an error and the bot will not
+trade.
+
+---
+
+## 4. State-of-the-world snapshot (last verified 2026-09-18)
+
+- **Tests:** `pytest -q` → `156 passed, 1 skipped` (the skip is `test_at_hhmm_wall_clock` — covered deterministically by `test_at_hhmm_computes_next_occurrence`).
+- **Branch:** `main`. Local HEAD ahead of `origin/main` by 9 commits pending this push.
+- **Bot process:** currently running (PID was 19716 at 14:10 IST, started 2026-09-18 with new regime-gate config). Open trades: 6. WS channels: 58.
+- **Operator process:** running (PID 19664).
+- **DVOL right now:** BTC ~34 (gate engaged, blocks BTC trades), ETH ~50 (gate engaged, blocks ETH trades). Bot logs `REGIME GATE closed for {cur}` once per currency per cycle.
+- **Mainnet:** still on testnet. User must supply `DERIBIT_CLIENT_ID` + `DERIBIT_CLIENT_SECRET` + flip `DERIBIT_LIVE_CONFIRMED=YES` + change `data.deribit_env: testnet` → `prod`. See §3b.
 
 ---
 
@@ -92,6 +140,10 @@ powershell -File scripts\operator_health.ps1
 # Watchdog + heartbeat + daily reset (Task Scheduler)
 .\install_scheduled_tasks.ps1
 
+# Mainnet readiness — env-var + config audit before flipping to live
+python scripts/mainnet_readiness.py           # human-readable
+python scripts/mainnet_readiness.py --json    # CI-friendly
+
 # All tests
 python -m pytest tests/ -v
 ```
@@ -100,9 +152,9 @@ Useful env vars (`.env`):
 
 | Var | Required for | Default |
 |---|---|---|
-| `DERIBIT_ENV` | which Deribit URL | `testnet` |
-| `DERIBIT_CURRENCIES` | underlying list | `BTC,ETH` |
-| `DERIBIT_LIVE_CONFIRMED` | live trading | `NO` |
+| `DERIBIT_CLIENT_ID` | mainnet private API | unset (testnet only) |
+| `DERIBIT_CLIENT_SECRET` | mainnet private API | unset (testnet only) |
+| `DERIBIT_LIVE_CONFIRMED` | live trading safety guard | `NO` |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | Telegram alerts | unset |
 | `MINIMAX_API_KEY` | LLM-driven agent layer | unset → rule-based fallback |
 | `MINIMAX_BASE_URL` | override the API endpoint | `https://agent.minimax.io/mavis/api/v1/llm/v1` |
@@ -129,6 +181,7 @@ crypto-options-bot/
 │   ├── broker/                              ← PaperClient, DeribitClient (with safety guard)
 │   ├── risk/                                ← Black-Scholes Greeks, RiskEngine + adaptive presets
 │   ├── strategy/                            ← 5 strategies (eligibility + plan)
+│   │   └── short_call.py    ← single-leg call-only (testnet-compatible, DTE-aware)
 │   ├── execution/                           ← OrderManager
 │   ├── alerts/                              ← TelegramAlerter
 │   ├── dashboard/                           ← stdlib http.server :8511
@@ -149,7 +202,8 @@ crypto-options-bot/
 │   ├── start_operator.ps1     ← detached operator launcher (PID file)
 │   ├── stop_operator.ps1      ← graceful kill
 │   ├── operator_health.ps1    ← exit-0 health probe (Task Scheduler)
-│   └── operator_status.py     ← pretty-print status
+│   ├── operator_status.py     ← pretty-print status
+│   └── mainnet_readiness.py   ← env-var + config audit before going live
 ├── start_bot_service.ps1        ← NSSM installer (+ install-operator)
 ├── start_bot_detached.ps1
 ├── stop_bot_service.ps1

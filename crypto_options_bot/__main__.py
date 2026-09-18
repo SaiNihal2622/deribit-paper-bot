@@ -278,6 +278,27 @@ class PaperRunner:
         self._min_iv_rank_to_trade = float(
             cfg.get("data", {}).get("min_iv_rank_to_trade", 30.0)
         )
+        # Min DTE gate (skip legs with DTE < this — no theta runway for 0DTE/1DTE)
+        self._min_dte_to_trade = float(
+            cfg.get("data", {}).get("min_dte_to_trade", 2.0)
+        )
+        # IV-regime circuit breaker. The bot pauses trading on a currency
+        # when EITHER DVOL < min_dvol OR iv_rank < min_iv_rank for that
+        # currency. Per-currency thresholds because BTC and ETH have
+        # different vol regimes.
+        rg_cfg = cfg.get("data", {}).get("iv_regime_gate", {}) or {}
+        self._regime_gate_enabled = bool(rg_cfg.get("enabled", True))
+        self._regime_gate_log_cooldown_sec = float(rg_cfg.get("log_cooldown_sec", 300))
+        self._regime_gate_thresholds: dict[str, tuple[float, float]] = {}
+        for cur in ("BTC", "ETH"):
+            cur_cfg = rg_cfg.get(cur, {}) or {}
+            self._regime_gate_thresholds[cur] = (
+                float(cur_cfg.get("min_dvol", 50.0)),
+                float(cur_cfg.get("min_iv_rank", 40.0)),
+            )
+        # Per-(currency, reason) timestamp of last "REGIME GATE engaged" log
+        # so we don't spam when the gate is closed for hours.
+        self._regime_gate_last_log: dict[tuple[str, str], float] = {}
 
     def _make_verbose_tick_callback(self) -> callable:
         """Return a tick callback that logs each tick at INFO if --verbose."""
@@ -435,9 +456,12 @@ class PaperRunner:
                 env=env,
                 currencies=currencies,
                 strike_window_pct=float(data_cfg.get("strike_window_pct", 0.20)),
-                max_strikes_per_underlying=int(ws_cfg.get("max_strikes_per_underlying", 9)),
+                max_strikes_per_underlying=int(ws_cfg.get("max_strikes_per_underlying", 21)),
+                max_strikes_per_expiry=int(ws_cfg.get("max_strikes_per_expiry", 5)),
+                expiry_count=int(ws_cfg.get("expiry_count", 5)),
+                min_dte=int(data_cfg.get("min_dte_to_trade", 2)),
                 reconnect_delay_sec=float(ws_cfg.get("reconnect_delay_sec", 2.0)),
-                max_reconnect_attempts=int(ws_cfg.get("max_reconnect_attempts", 10)),
+                max_reconnect_attempts=int(ws_cfg.get("max_reconnect_attempts", 10000)),
                 dvol_cache_sec=float(ws_cfg.get("dvol_cache_sec", 300.0)),
             )
             ws_feed.start()
@@ -583,6 +607,7 @@ class PaperRunner:
             strikes=strikes,
             option_ltps=option_ltps,
             option_ivs=option_ivs,
+            expiry_ddmmyy=feed.get_nearest_expiry(underlying) or "",
         )
         # Stash side-channel data strategies may consult
         ctx._momentum = mom  # type: ignore[attr-defined]
@@ -623,6 +648,41 @@ class PaperRunner:
                 status="rejected", reason="data_quality_bad / min_iv_rank gate",
             )
             return
+
+        # IV-regime circuit breaker (NEW 2026-09-18).
+        # Pauses the bot when the market regime is too quiet for short
+        # premium to be profitable. Per-currency thresholds because BTC
+        # and ETH have different vol regimes. The gate is evaluated for
+        # the strategy's underlying; ETH in a high-vol regime can still
+        # trade while BTC in a low-vol regime cannot.
+        if self._regime_gate_enabled:
+            cur = (ctx.underlying or "").upper()
+            min_dvol, min_iv_rank = self._regime_gate_thresholds.get(
+                cur, (50.0, 40.0)
+            )
+            dvol = float(getattr(ctx, "dvol", 0.0) or 0.0)
+            ivr = float(getattr(ctx, "iv_rank", 0.0) or 0.0)
+            reasons = []
+            if dvol > 0 and dvol < min_dvol:
+                reasons.append(f"dvol={dvol:.0f}<{min_dvol:.0f}")
+            if ivr > 0 and ivr < min_iv_rank:
+                reasons.append(f"iv_rank={ivr:.0f}<{min_iv_rank:.0f}")
+            if reasons:
+                reason = " / ".join(reasons)
+                now = time.time()
+                last_log_key = (cur, reason)
+                last_ts = self._regime_gate_last_log.get(last_log_key, 0.0)
+                if now - last_ts >= self._regime_gate_log_cooldown_sec:
+                    logger.info(
+                        f"[{name}] REGIME GATE closed for {cur}: {reason}. "
+                        f"Waiting for vol to recover (no trades)."
+                    )
+                    self._regime_gate_last_log[last_log_key] = now
+                self.signal_log.append(
+                    strategy=name, underlying=cur,
+                    status="rejected", reason=f"regime_gate: {reason}",
+                )
+                return
 
         try:
             plan = strategy.build_plan(ctx, account_state=account_state)

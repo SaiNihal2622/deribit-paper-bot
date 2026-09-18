@@ -46,6 +46,10 @@ class SignalContext:
     # event context
     upcoming_event: Optional[str] = None
     minutes_to_event: Optional[int] = None
+    # NEW (2026-09-18): the DDMMMYY of the expiry the strategy's strikes
+    # come from. Lets strategies apply a DTE filter without round-tripping
+    # back to the feed. Empty string if unknown (multi-expiry mixes).
+    expiry_ddmmyy: str = ""
 
 
 @dataclass

@@ -101,9 +101,12 @@ class DeribitWebSocketFeed:
         env: str = "testnet",
         currencies: Optional[list[str]] = None,
         strike_window_pct: float = 0.20,
-        max_strikes_per_underlying: int = 9,
+        max_strikes_per_underlying: int = 15,
+        max_strikes_per_expiry: int = 7,
+        expiry_count: int = 3,
+        min_dte: int = 0,
         reconnect_delay_sec: float = 2.0,
-        max_reconnect_attempts: int = 10,
+        max_reconnect_attempts: int = 10000,
         heartbeat_sec: float = 60.0,
         dvol_cache_sec: float = 300.0,
         timeout: int = DEFAULT_TIMEOUT,
@@ -116,8 +119,16 @@ class DeribitWebSocketFeed:
             strike_window_pct: subscription filter for strikes around ATM
                 (currently informational; channels are subscribed for an
                 ATM +/- max_strikes_per_underlying//2 strike window).
-            max_strikes_per_underlying: how many strike ticks to subscribe
-                per currency. 9 means ATM +/- 4 strikes.
+            max_strikes_per_underlying: total channels across all expiries
+                (kept for backward compatibility; per-expiry cap below).
+            max_strikes_per_expiry: ATM +/- N strikes to subscribe per
+                expiry date. 7 means ATM +/- 3 strikes per expiry.
+            expiry_count: how many future expiries to subscribe (today,
+                weekly, monthly, etc). 3 gives the next 3 expiries
+                which covers same-day + next-week + next-month.
+            min_dte: minimum days-to-expiry for any subscribed expiry.
+                Expiries with DTE < this are skipped during subscription.
+                0 = no filter (legacy). 2 = skip 0DTE/1DTE.
             reconnect_delay_sec: sleep between reconnect attempts.
             max_reconnect_attempts: number of reconnect tries before giving up.
             heartbeat_sec: heartbeat log interval.
@@ -137,6 +148,12 @@ class DeribitWebSocketFeed:
         self.currencies = [c.upper() for c in (currencies or ["BTC", "ETH"])]
         self.strike_window_pct = float(strike_window_pct)
         self.max_strikes_per_underlying = int(max(1, max_strikes_per_underlying))
+        self.max_strikes_per_expiry = int(max(1, max_strikes_per_expiry))
+        self.expiry_count = int(max(1, expiry_count))
+        # NEW (2026-09-18): Minimum DTE for any subscribed expiry. The feed
+        # drops expiries with DTE < this so we don't poll short-dated strikes
+        # that have no theta runway. 0 = no filter (legacy behaviour).
+        self.min_dte = max(0, int(min_dte))
         self.reconnect_delay_sec = max(0.1, float(reconnect_delay_sec))
         self.max_reconnect_attempts = int(max(0, max_reconnect_attempts))
         self.heartbeat_sec = max(5.0, float(heartbeat_sec))
@@ -557,21 +574,63 @@ class DeribitWebSocketFeed:
         # Without a quick instruments lookup we'd otherwise subscribe to
         # nothing for the option chain on first start. The REST fallback in
         # _fetch_instruments() (used opportunistically) seeds this cache.
+        #
+        # Multi-expiry support: subscribe to the next N expiries (default
+        # 3 = today/weekly/monthly) so the bot can find liquid strikes
+        # across the term structure. Same-day puts on testnet often have
+        # $0 quotes; weeklies/monthlies have proper liquidity.
         out: list[str] = []
         for currency in self.currencies:
             instruments = self._get_cached_instruments(currency)
             if not instruments:
                 continue
-            nearest = self._nearest_expiry_from_instruments(instruments, currency)
-            if not nearest:
-                continue
-            # spot snapshot to decide the strip
             with self._lock:
                 spot = self._spot.get(currency, 0.0)
-            strikes = self._strip_for_expiry(instruments, currency, nearest, spot)
-            for s in strikes:
-                out.append(f"ticker.{s}.100ms")
+            expiries = self._next_n_expiries(
+                instruments, currency, self.expiry_count, self.min_dte
+            )
+            for expiry_iso in expiries:
+                strikes = self._strip_for_expiry(
+                    instruments, currency, expiry_iso, spot,
+                    self.max_strikes_per_expiry,
+                )
+                for s in strikes:
+                    out.append(f"ticker.{s}.100ms")
         return out
+
+    @staticmethod
+    def _next_n_expiries(instruments: list[dict], currency: str, n: int,
+                         min_dte: int = 0) -> list[str]:
+        """Return the next N distinct expiry dates (ISO), today-or-future,
+        sorted ascending. If ``min_dte > 0`` expiries with DTE < ``min_dte``
+        are dropped before the cap is applied (so 0DTE is skipped when
+        min_dte=2 and the next weekly takes its slot).
+        """
+        seen: set[str] = set()
+        out: list[str] = []
+        today = datetime.now(timezone.utc).date()
+        for ins in instruments:
+            name = ins.get("instrument_name", "")
+            meta = parse_deribit_instrument(name)
+            if not meta or meta["underlying"] != currency:
+                continue
+            try:
+                exp_dt = datetime.strptime(meta["expiry_iso"], "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if exp_dt < today:
+                continue
+            if min_dte > 0 and (exp_dt - today).days < min_dte:
+                continue
+            iso = meta["expiry_iso"]
+            if iso in seen:
+                continue
+            seen.add(iso)
+            out.append((exp_dt, iso))
+            if len(out) >= n:
+                break
+        out.sort(key=lambda x: x[0])
+        return [iso for _, iso in out]
 
     def _get_cached_instruments(self, currency: str) -> list[dict]:
         """Return instruments from cache, refreshing if stale."""
@@ -621,13 +680,16 @@ class DeribitWebSocketFeed:
         currency: str,
         expiry_iso: str,
         spot: float,
+        cap: int = 0,
     ) -> list[str]:
         """Pick the ATM-strip instruments for a given expiry.
 
-        Returns up to max_strikes_per_underlying instrument names centered on
-        the ATM strike. If we don't have a spot yet, just take the first
-        max_strikes_per_underlying for the expiry.
+        Returns up to `cap` (default: max_strikes_per_expiry) instrument
+        names centered on the ATM strike. If we don't have a spot yet,
+        just take the first `cap` for the expiry.
         """
+        if cap <= 0:
+            cap = self.max_strikes_per_expiry
         names = []
         for ins in instruments:
             name = ins.get("instrument_name", "")
@@ -645,16 +707,16 @@ class DeribitWebSocketFeed:
         else:
             step = 50
         if spot <= 0:
-            return [n for _, _, n in sorted(names)[: self.max_strikes_per_underlying]]
+            return [n for _, _, n in sorted(names)[: cap]]
         atm = int(round(spot / step) * step)
-        half = self.max_strikes_per_underlying // 2
+        half = cap // 2
         lo = atm - half * step
-        hi = atm + (self.max_strikes_per_underlying - 1 - half) * step
+        hi = atm + (cap - 1 - half) * step
         out = []
         for strike, _opt, n in sorted(names):
             if lo <= strike <= hi:
                 out.append(n)
-                if len(out) >= self.max_strikes_per_underlying:
+                if len(out) >= cap:
                     break
         return out
 

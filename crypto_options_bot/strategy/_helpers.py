@@ -23,6 +23,42 @@ _MONTHS = {
 }
 
 
+def dte_from_ddmmyy(ddmmyy: str) -> Optional[int]:
+    """Return days-to-expiry (DTE) for a Deribit-format DDMMMYY string.
+
+    Returns None if the string can't be parsed. Today counts as DTE=0.
+    """
+    if not ddmmyy or len(ddmmyy) != 7:
+        return None
+    try:
+        dd = int(ddmmyy[0:2])
+        mmm = ddmmyy[2:5]
+        yy = int(ddmmyy[5:7])
+        exp_dt = date(2000 + yy, _MONTHS[mmm], dd)
+    except (KeyError, ValueError):
+        return None
+    today = datetime.now(timezone.utc).date()
+    return (exp_dt - today).days
+
+
+def filter_expiries_by_min_dte(expiries_iso: list[str], min_dte: int) -> list[str]:
+    """Return only those ISO expiry dates whose DTE >= ``min_dte``.
+
+    Used by the bot to drop 0DTE/1DTE strikes that have no theta runway.
+    """
+    today = datetime.now(timezone.utc).date()
+    out: list[str] = []
+    for iso in expiries_iso or []:
+        try:
+            exp_dt = datetime.strptime(iso, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        dte = (exp_dt - today).days
+        if dte >= min_dte:
+            out.append(iso)
+    return out
+
+
 def snap_strike(target: float, valid_strikes: list[float]) -> Optional[float]:
     """Snap ``target`` to the nearest strike in ``valid_strikes``.
 
@@ -154,4 +190,6 @@ __all__ = [
     "effective_bid_ask",
     "best_atm_iv",
     "option_ltp_with_proxy",
+    "dte_from_ddmmyy",
+    "filter_expiries_by_min_dte",
 ]

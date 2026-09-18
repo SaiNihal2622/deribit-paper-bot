@@ -32,13 +32,37 @@ data:
   ws:
     reconnect_delay_sec: 2.0
     max_reconnect_attempts: 10000  # effectively unlimited; we never want to give up
-    max_strikes_per_underlying: 15   # wider strip — find liquid strikes on testnet
+    max_strikes_per_underlying: 21  # legacy, kept for backward-compat
+    max_strikes_per_expiry: 5     # ATM +/- 2 strikes per expiry (5 total)
+    expiry_count: 5                # today + next weeklies + monthlies — wider runway
     dvol_cache_sec: 300              # DVOL index cache lifetime
+    # Minimum DTE (days-to-expiry) for any leg to be eligible for trading.
+    # Stops the bot from firing 0DTE / 1DTE trades that have no theta runway.
+    # 2 = skip today and tomorrow, take only weeklies and longer.
+    min_dte_to_trade: 2
+
+  # NEW (2026-09-18): IV-regime circuit breaker. Pauses the bot when the
+  # market is too quiet for short-premium to be profitable. The thresholds
+  # are per-currency because BTC and ETH have different vol regimes.
+  # The bot skips ALL strategies on a currency when EITHER DVOL < min_dvol
+  # OR iv_rank < min_iv_rank. Set per-currency DVOL floors high enough that
+  # short premium actually pays.
+  iv_regime_gate:
+    enabled: true
+    # How often (seconds) to log a "REGIME GATE closed" message when the gate
+    # is engaged. Prevents log spam when vol stays low for hours.
+    log_cooldown_sec: 300
+    BTC:
+      min_dvol: 50.0          # BTC DVOL must be >= 50 to sell premium
+      min_iv_rank: 40.0       # AND iv_rank >= 40
+    ETH:
+      min_dvol: 55.0          # ETH DVOL is structurally higher
+      min_iv_rank: 45.0
 
 risk:
   r: 0.045                     # risk-free rate (US 10Y proxy)
   starting_capital: 100000.0
-  max_open_positions: 4
+  max_open_positions: 6        # was 4 — wider runway for multi-expiry universe
   max_daily_loss_pct: 5.0
   max_trade_loss_pct: 2.0
   high_dvol_threshold: 80.0
@@ -55,7 +79,7 @@ risk:
       high_dvol_threshold: 90.0
       high_iv_rank_threshold: 80.0
     base:
-      max_open_positions: 4
+      max_open_positions: 6
       max_daily_loss_pct: 5.0
       max_trade_loss_pct: 2.0
       high_dvol_threshold: 80.0
@@ -89,8 +113,8 @@ strategy:
     target_delta: 0.20
     profit_target_pct: 50
     stop_loss_multiplier: 2.0
-    min_iv_rank: 50
-    max_dvol: 80.0
+    min_iv_rank: 35            # lower threshold — fire in mid-vol regimes too
+    max_dvol: 90.0             # tolerate higher DVOL for short premium
     wing_atm_mult: 0.05
   directional_debit:           # NEW strategy: single-leg long option
     min_momentum: 0.02

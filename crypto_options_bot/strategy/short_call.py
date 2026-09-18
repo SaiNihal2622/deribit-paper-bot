@@ -20,6 +20,7 @@ Eligibility:
   - iv_rank >= min_iv_rank  (we want to sell premium in rich vol regimes)
   - dvol < max_dvol          (avoid blowing out on vol spikes)
   - call LTP must have a real bid+ask (not just a synthetic price)
+  - the strike's expiry DTE >= min_dte_to_trade (we want theta runway)
 
 This is a deliberately narrow strategy to fill the gap left by the
 multi-leg strategies when put liquidity is missing.
@@ -30,6 +31,7 @@ import logging
 from typing import Optional
 
 from .base import StrategyName, TradePlan
+from ._helpers import dte_from_ddmmyy
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +45,13 @@ class ShortCallStrategy:
         self.target_delta = float(cfg.get("target_delta", 0.20))
         self.profit_target_pct = float(cfg.get("profit_target_pct", 50))
         self.stop_loss_multiplier = float(cfg.get("stop_loss_multiplier", 2.0))
-        self.min_iv_rank = float(cfg.get("min_iv_rank", 50.0))
-        self.max_dvol = float(cfg.get("max_dvol", 80.0))
+        self.min_iv_rank = float(cfg.get("min_iv_rank", 35.0))
+        self.max_dvol = float(cfg.get("max_dvol", 90.0))
         self.wing_atm_mult = float(cfg.get("wing_atm_mult", 0.05))
         self.min_open_interest = float(cfg.get("min_open_interest", 1.0))
+        # NEW (2026-09-18): Minimum DTE for the picked leg's expiry. Stops
+        # the bot from firing 0DTE / 1DTE shorts that have no theta runway.
+        self.min_dte = int(cfg.get("min_dte_to_trade", 2))
 
     def is_eligible(self, ctx, account_state) -> tuple[bool, str]:
         if ctx.iv_rank < self.min_iv_rank:
@@ -88,6 +93,17 @@ class ShortCallStrategy:
             )
             return None
 
+        # DTE filter: refuse to build a plan on 0DTE / 1DTE legs. The bot
+        # already subscribes to multiple expiries; this enforces that we
+        # only use expiries with enough theta runway.
+        expiry_ddmmyy = getattr(ctx, "expiry_ddmmyy", None) or ""
+        dte = dte_from_ddmmyy(expiry_ddmmyy) if expiry_ddmmyy else None
+        if dte is not None and dte < self.min_dte:
+            logger.debug(
+                f"short_call: expiry {expiry_ddmmyy} has DTE={dte} < min_dte={self.min_dte}, skip"
+            )
+            return None
+
         net_credit = sc
         stop = net_credit * 2.0 * self.stop_loss_multiplier
         target = net_credit * (self.profit_target_pct / 100.0)
@@ -113,6 +129,7 @@ class ShortCallStrategy:
                 f"short_call: high IV (iv_rank={ctx.iv_rank:.0f}) "
                 f"+ range regime, sell {sc_strike} OTM call for "
                 f"${sc:.4f} credit, target ${target:.4f}, stop ${stop:.4f}"
+                + (f" (DTE={dte})" if dte is not None else "")
             ),
         )
 
