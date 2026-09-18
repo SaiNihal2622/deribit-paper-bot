@@ -32,7 +32,7 @@ data:
   ws:
     reconnect_delay_sec: 2.0
     max_reconnect_attempts: 10000  # effectively unlimited; we never want to give up
-    max_strikes_per_underlying: 9   # ATM +/- 4 strikes by default
+    max_strikes_per_underlying: 15   # wider strip — find liquid strikes on testnet
     dvol_cache_sec: 300              # DVOL index cache lifetime
 
 risk:
