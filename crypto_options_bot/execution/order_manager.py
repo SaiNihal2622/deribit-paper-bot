@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -73,7 +74,71 @@ class OrderManager:
         self._symbol_to_trade: dict[str, str] = {}
         self._on_trade_event: Optional[Callable] = None
         self._lock = RLock()
+        self._fill_log: dict[str, list[dict]] = {}  # order_id -> [fill events]
         self._load_state()
+        # Subscribe to ticks so we can update per-trade realized_pnl
+        # whenever a close-order fill lands on the broker.
+        try:
+            self.broker.on_tick(self._on_broker_tick)
+        except Exception:
+            pass
+
+    def _on_broker_tick(self, tick) -> None:
+        """On every broker tick, scan our orders for new fills and
+        update trade.realized_pnl for any trades that just had a
+        closing leg fill. This is what was missing — the broker's
+        _apply_fill correctly updates broker._realized_pnl, but the
+        trade's per-trade realized_pnl was stuck at 0 because nobody
+        propagated the fill event to the trade."""
+        try:
+            for order_id, order in list(self.broker._orders.items()):
+                if getattr(order, "status", None) != "COMPLETE":
+                    continue
+                # Skip orders we've already seen.
+                seen = self._fill_log.setdefault(order_id, [])
+                if seen:
+                    continue
+                seen.append({"ts": time.time(), "fill_price": float(order.avg_fill_price or 0.0),
+                              "qty": float(order.filled_qty or 0.0), "side": order.side.value})
+                # Find the trade this order belongs to.
+                trade_id = self._symbol_to_trade.get(order.symbol)
+                if not trade_id:
+                    continue
+                with self._lock:
+                    trade = self._trades.get(trade_id)
+                    if not trade:
+                        continue
+                    # Determine if this is an entry or close leg by tag.
+                    tag = getattr(order, "tag", "") or ""
+                    if tag.startswith("close_"):
+                        # Closing leg fill: compute the close leg's
+                        # contribution to realized_pnl using avg fill
+                        # prices for entry + close.
+                        entry_orders = [o for o in trade.orders
+                                        if not (getattr(o, "tag", "") or "").startswith("close_")]
+                        close_orders = [o for o in trade.orders
+                                        if (getattr(o, "tag", "") or "").startswith("close_")]
+                        if not entry_orders:
+                            continue
+                        # For each entry leg that has a matching close
+                        # leg by symbol, compute realized delta.
+                        leg_pnl = 0.0
+                        for eo in entry_orders:
+                            # Find the close leg for this symbol.
+                            co = next((c for c in close_orders
+                                       if c.symbol == eo.symbol), None)
+                            if co and co.avg_fill_price and eo.avg_fill_price:
+                                # For SELL entries, pnl = entry - close.
+                                # For BUY entries (long), pnl = close - entry.
+                                if eo.side.value == "SELL":
+                                    leg_pnl += (float(eo.avg_fill_price) - float(co.avg_fill_price)) * float(eo.filled_qty)
+                                else:
+                                    leg_pnl += (float(co.avg_fill_price) - float(eo.avg_fill_price)) * float(eo.filled_qty)
+                        # Update trade.realized_pnl with the new total.
+                        trade.realized_pnl = float(getattr(trade, "realized_pnl", 0.0) or 0.0) + leg_pnl
+                        _refresh_derived(trade)
+        except Exception as e:
+            logger.debug(f"order_manager tick hook: {e}")
 
     def set_event_callback(self, cb: Callable) -> None:
         self._on_trade_event = cb
@@ -286,11 +351,33 @@ class OrderManager:
                 if order.status != OrderStatus.COMPLETE:
                     continue
                 close_side = OrderSide.SELL if order.side == OrderSide.BUY else OrderSide.BUY
+                # Use LIMIT at the entry fill price rather than MARKET.
+                # MARKET on testnet strikes that have ltp=0 falls back to
+                # spot * 0.5% in PaperClient, which is wildly off for far
+                # OTM options and produces fake multi-hundred-dollar
+                # losses. LIMIT-at-entry either fills at the entry
+                # price (pnl ~= 0) or sits unfilled (no fake loss).
+                # When the testnet DOES quote the symbol at or better
+                # than entry, the limit fills normally.
+                close_price = float(order.avg_fill_price or 0.0)
+                if close_price <= 0:
+                    # Fallback: use the plan target/stop as a sane
+                    # close price so we never go in with price=0.
+                    if reason == "target_hit" and trade.plan and trade.plan.target:
+                        # Per-leg target = total_target / leg_count
+                        legs = len(trade.orders) or 1
+                        close_price = float(trade.plan.target) / legs
+                    elif trade.plan and trade.plan.stop:
+                        legs = len(trade.orders) or 1
+                        # Stop = 2x credit typically; close at entry
+                        # + (stop / legs) so we limit our loss.
+                        close_price = float(order.expected_fill_price or 0.0)
                 close_order = Order(
                     symbol=order.symbol,
                     side=close_side,
                     qty=order.filled_qty,
-                    order_type=OrderType.MARKET,
+                    order_type=OrderType.LIMIT,
+                    price=close_price if close_price > 0 else 0.01,
                     tag=f"close_{order.order_id}",
                     exchange=order.exchange,
                     strike=order.strike,

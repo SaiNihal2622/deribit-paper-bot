@@ -504,20 +504,32 @@ class PaperRunner:
         # price so the strategy can build a plan.
         synth_count = 0
         # Compute TTE for BS in years (assume nearest expiry).
-        _days_to_expiry = 0.0
+        # Use HOURS not days, because floor-1-day overstates TTE for
+        # options expiring later today and gives ~3x inflated synthetic
+        # prices (e.g. 1-day floor returns ~$53 for a BTC OTM put when
+        # the actual 5-hour TTE is ~$13).
+        _hours_to_expiry = 24.0  # default to 1 day if we can't parse
         try:
             _ddmmyy = feed.get_nearest_expiry(underlying)
-            if _ddmmyy and len(_ddmmyy) >= 7:
-                _d = int(_ddmmyy[0:2])
-                _MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
-                           "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-                _m = _MONTHS[_ddmmyy[2:5]]
-                _y = 2000 + int(_ddmmyy[5:7])
-                _exp_date = date(_y, _m, _d)
-                _days_to_expiry = max(0.0, (_exp_date - datetime.now(timezone.utc).date()).days)
+            # get_nearest_expiry may return either ISO ("2026-09-18")
+            # or DDMMMYY ("18SEP26") depending on version. Detect both.
+            if _ddmmyy:
+                if len(_ddmmyy) == 10 and _ddmmyy[4] == "-":  # YYYY-MM-DD
+                    _exp_date = date.fromisoformat(_ddmmyy)
+                    _hours_to_expiry = max(1.0,
+                        (_exp_date - datetime.now(timezone.utc).date()).days * 24.0)
+                elif len(_ddmmyy) >= 7:  # DDMMMYY
+                    _d = int(_ddmmyy[0:2])
+                    _MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                               "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+                    _m = _MONTHS[_ddmmyy[2:5]]
+                    _y = 2000 + int(_ddmmyy[5:7])
+                    _exp_date = date(_y, _m, _d)
+                    _hours_to_expiry = max(1.0,
+                        (_exp_date - datetime.now(timezone.utc).date()).days * 24.0)
         except Exception:
             pass
-        _tte_years = max(_days_to_expiry, 1.0) / 365.0  # floor 1 day to avoid degenerate TTE
+        _tte_years = _hours_to_expiry / (24.0 * 365.0)
         for s in strikes:
             ce = oi_map[s].get("ce_ltp", 0.0)
             pe = oi_map[s].get("pe_ltp", 0.0)
@@ -562,6 +574,13 @@ class PaperRunner:
                 f"[{underlying}] synthesized {synth_count} option prices via Black-Scholes "
                 f"(testnet had bid=0/ask=0 but mark_iv is real)"
             )
+            # DEBUG: dump first 5 synthetic prices so we can verify they look sane.
+            for (s2, ot), price in list(option_ltps.items())[:6]:
+                if ot == "P":
+                    iv_used = option_ivs.get((s2, ot), 0.0)
+                    logger.info(
+                        f"  [DEBUG] {underlying} {ot} K={s2} synth={price:.4f} iv={iv_used:.3f} spot={spot:.0f}"
+                    )
         atm = feed.get_atm_strike(underlying)
         atm_iv = 0.0
         if atm:

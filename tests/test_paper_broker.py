@@ -142,8 +142,11 @@ def test_limit_order_rejected_outside_band(tmp_path):
 
 
 def test_force_fill_market_like_with_no_tick(tmp_path):
-    """market_like mode force-fills even with no tick (using the $1 fallback
-    or the underlying-derived ref)."""
+    """market_like mode does NOT fake-fill when neither the option tick
+    nor any safe fallback (BS synthetic / position avg) is available.
+    Old code used spot*0.5% which produced bogus multi-hundred-dollar
+    fills for far-OTM options. The new behavior is to SKIP — leave the
+    order OPEN and try again on the next tick."""
     persist = tmp_path / "paper.json"
     broker = PaperClient(
         starting_capital=10_000.0,
@@ -151,23 +154,23 @@ def test_force_fill_market_like_with_no_tick(tmp_path):
         persist_path=str(persist),
     )
     broker.connect()
-    # Inject a spot tick so the underlying-derived ref works
+    # Inject only the spot tick — no option tick, no IV, no position.
     broker.inject_tick(_make_tick("BTC", ltp=60_000.0))
     order = Order(
         symbol="BTC-26DEC25-100000-C",
         side=OrderSide.BUY,
         qty=1,
         order_type=OrderType.LIMIT,
-        price=0.0,  # not set — fall back to spot-derived ref
+        price=0.0,  # not set, no tick, no IV, no position avg
         strike=100000.0,
         option_type="C",
         underlying="BTC",
     )
     out = broker.place_order(order)
-    assert out.status == OrderStatus.COMPLETE
-    # Spot 60000 * 0.5% = 300.0 ref
-    assert out.avg_fill_price > 0
-    assert abs(out.avg_fill_price - 300.0) < 1.0
+    # New behavior: SKIP. Order stays OPEN, no fake fill.
+    assert out.status == OrderStatus.OPEN
+    assert out.avg_fill_price == 0.0
+    assert broker.get_positions() == []
 
 
 def test_position_avg_price_on_add(tmp_path):

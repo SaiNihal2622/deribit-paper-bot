@@ -131,11 +131,16 @@ class PaperClient(BrokerClient):
         """Force-fill a still-open order in market_like mode.
 
         Fallback chain (in order):
-          1. Cached tick for the option symbol
-          2. Order's limit price (if set)
-          3. Order's expected_fill_price (if set)
-          4. Underlying's last-known spot * 0.5% (ATM-ish estimate for crypto options)
-          5. $1.00 (last resort — never skip a fill in paper mode)
+          1. Cached tick for the option symbol (real LTP from WS feed)
+          2. Order's limit price (the price the strategy computed)
+          3. Order's expected_fill_price (set by _try_fill on first tick)
+          4. Black-Scholes synthetic price from mark_iv (if published)
+          5. Position's avg_price (if closing an existing position)
+          6. SKIP — leave the order OPEN. We will NEVER use spot*0.5%
+              as a fallback; that's wildly off for far OTM options and
+              causes fake multi-hundred-dollar losses. Sitting OPEN
+              is correct: the position is tracked, the order is
+              pending, and we'll try again on the next tick.
         """
         tick = self._ticks.get(order.symbol)
         if tick is not None and tick.ltp > 0:
@@ -145,28 +150,56 @@ class PaperClient(BrokerClient):
         elif order.expected_fill_price and order.expected_fill_price > 0:
             ref_price = order.expected_fill_price
         else:
-            # Fallback 4: ATM-ish estimate from underlying's spot.
+            # Fallback 4: Black-Scholes synthetic from mark_iv if available.
+            bs_price = 0.0
             underlying = (order.underlying or "").upper()
-            underlying_ltp = 0.0
-            if underlying:
-                # Spot ticks use the bare symbol ("BTC" / "ETH")
-                spot_tick = self._ticks.get(underlying)
-                if spot_tick and spot_tick.ltp > 0:
-                    underlying_ltp = spot_tick.ltp
-            if underlying_ltp > 0:
-                ref_price = round(underlying_ltp * 0.005, 4)  # ~0.5% of spot
+            iv = float(tick.iv) if (tick is not None and getattr(tick, "iv", None)) else 0.0
+            if underlying and iv > 0 and order.strike and order.expiry:
+                try:
+                    from ..risk.greeks import bs_greeks
+                    opt_type = "C" if (order.option_type or "").upper().startswith("C") else "P"
+                    # TTE: use HOURS not days. floor=1 hour to avoid
+                    # degenerate TTE. Floor-1-day overstates synthetic
+                    # price for options expiring later today.
+                    try:
+                        from datetime import date
+                        ed = date.fromisoformat(order.expiry)
+                        hours = max(1, (ed - date.today()).days * 24)
+                    except Exception:
+                        hours = 24
+                    spot_tick = self._ticks.get(underlying)
+                    spot = float(spot_tick.ltp) if (spot_tick and spot_tick.ltp > 0) else 0.0
+                    if spot > 0:
+                        g = bs_greeks(spot=spot, strike=float(order.strike),
+                                      time_to_expiry_years=hours / (24.0 * 365.0),
+                                      vol=iv, option_type=opt_type)
+                        if g.price > 0:
+                            bs_price = g.price
+                except Exception:
+                    bs_price = 0.0
+            if bs_price > 0:
+                ref_price = round(bs_price, 4)
                 logger.debug(
-                    f"[PAPER] FORCE_FILL underlying-derived ref for {order.order_id} "
-                    f"{order.symbol}: underlying={underlying} ltp={underlying_ltp} -> ref={ref_price}"
+                    f"[PAPER] FORCE_FILL BS-synthetic ref for {order.order_id} "
+                    f"{order.symbol}: iv={iv:.3f} -> ref={ref_price}"
                 )
             else:
-                # Fallback 5: last-resort synthetic $1.00. Never skip a fill in paper mode.
-                ref_price = 1.0
-                logger.warning(
-                    f"[PAPER] FORCE_FILL last-resort ref for {order.order_id} {order.symbol}: "
-                    f"no tick, no price, no expected_fill_price, no underlying — using $1.00 "
-                    f"(check that {order.underlying} spot feed is alive)"
-                )
+                # Fallback 5: position's avg_price (closing what we opened).
+                pos = self._positions.get(order.symbol)
+                if pos and pos.avg_price > 0:
+                    ref_price = float(pos.avg_price)
+                    logger.debug(
+                        f"[PAPER] FORCE_FILL position-avg ref for {order.order_id} "
+                        f"{order.symbol}: avg_price={ref_price}"
+                    )
+                else:
+                    # Fallback 6: SKIP. Don't fake-fill.
+                    logger.warning(
+                        f"[PAPER] FORCE_FILL SKIPPED for {order.order_id} {order.symbol}: "
+                        f"no tick, no price, no expected_fill_price, no BS price, no "
+                        f"position avg — order will stay OPEN and try again next tick"
+                    )
+                    return
         slip = ref_price * (self.slippage_bps / 10_000)
         fill_price = ref_price + (slip if order.side == OrderSide.BUY else -slip)
         fill_price = round(fill_price, 4)
