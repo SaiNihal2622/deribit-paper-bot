@@ -195,8 +195,7 @@ class DeribitWebSocketFeed:
         # the more pings we send and the more idle CPU + syscalls on the WS
         # socket, so 60s is a good balance that keeps the connection alive
         # without burning resources.
-        self._ping_interval_sec: float = 60.0
-        self._ping_interval_sec: float = 30.0
+        self._ping_interval_sec: float = 60.0  # once / minute; 2x safety vs Deribit's ~2-min idle
 
     # -----------------------------------------------------------------------
     # Public API — mirrors DeribitFeed
@@ -516,7 +515,7 @@ class DeribitWebSocketFeed:
             time.sleep(self.reconnect_delay_sec)
             self._reconnect_attempts += 1
 
-    def _keepalive_loop(self) -> None:
+    def _keepalive_loop(self, max_iterations: Optional[int] = None) -> None:
         """Background thread that sends a `public/test_request` heartbeat to
         Deribit every `_ping_interval_sec` seconds.
 
@@ -525,9 +524,16 @@ class DeribitWebSocketFeed:
         which causes a needless reconnect storm every couple of minutes.
 
         Runs until `_running` flips to False (see stop()).
+
+        Args:
+            max_iterations: optional safety cap; the loop exits after N full
+                iterations even if `_running` stays True. Production callers
+                pass None (never exit normally). Tests pass a small int to
+                bound runtime.
         """
         # Wait for the main loop to connect before starting
         time.sleep(2.0)
+        iterations = 0
         while True:
             with self._lock:
                 if not self._running:
@@ -536,20 +542,23 @@ class DeribitWebSocketFeed:
                 connected = self._connected
             if not connected or ws is None:
                 time.sleep(1.0)
-                continue
-            try:
-                ws.send(json.dumps({
-                    "jsonrpc": "2.0",
-                    "method": "public/test_request",
-                    "id": int(time.time() * 1000) & 0x7FFFFFFF,
-                }))
-                with self._lock:
-                    self._last_ping_ts = time.time()
-            except Exception as e:
-                # Send failed — let the main loop notice the disconnect
-                # on its own; we just sleep and try again next cycle.
-                logger.debug(f"keepalive send failed: {e}")
-            time.sleep(self._ping_interval_sec)
+            else:
+                try:
+                    ws.send(json.dumps({
+                        "jsonrpc": "2.0",
+                        "method": "public/test_request",
+                        "id": int(time.time() * 1000) & 0x7FFFFFFF,
+                    }))
+                    with self._lock:
+                        self._last_ping_ts = time.time()
+                except Exception as e:
+                    # Send failed — let the main loop notice the disconnect
+                    # on its own; we just sleep and try again next cycle.
+                    logger.debug(f"keepalive send failed: {e}")
+                time.sleep(self._ping_interval_sec)
+            iterations += 1
+            if max_iterations is not None and iterations >= max_iterations:
+                return
 
     def _should_reconnect(self) -> bool:
         """Decide whether to keep trying after a disconnect."""
