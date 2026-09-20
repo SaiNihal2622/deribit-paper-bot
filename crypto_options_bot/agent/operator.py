@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -45,6 +46,24 @@ from .tools import ToolCategory, ToolRegistry
 from .trader import Trader
 
 log = logging.getLogger(__name__)
+
+# Wire up the agent layer's stdlib logger to write to stderr (which NSSM
+# redirects to logs/operator_stderr.log). Without a handler, log.info() calls
+# are silently dropped because Python's logging defaults to WARNING-level
+# output with no handler attached. We use the agent logger name as the
+# prefix so the NSSM log file clearly identifies agent-layer output.
+if not log.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s | %(levelname)-5s | %(name)s:%(funcName)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    log.addHandler(_handler)
+    log.setLevel(logging.INFO)
+    # Don't double-log via root logger if anyone adds a root handler later.
+    log.propagate = False
 
 
 @dataclass

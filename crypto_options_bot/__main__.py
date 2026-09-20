@@ -465,15 +465,21 @@ class PaperRunner:
                 dvol_cache_sec=float(ws_cfg.get("dvol_cache_sec", 300.0)),
             )
             ws_feed.start()
-            # Give it up to 3 seconds to connect.
+            # Give it up to 15 seconds to connect. Deribit's WSS handshake
+            # can take 5-8s on a slow network and we now have a keepalive
+            # thread (public/test_request every 30s) that prevents the
+            # 2-min idle reconnect storm. Fall back to REST if WS still
+            # hasn't connected so the bot can trade immediately; it can
+            # be upgraded back to WS by a future restart.
             connected = False
-            for _ in range(30):
+            deadline = time.time() + 15.0
+            while time.time() < deadline:
                 if ws_feed.is_connected():
                     connected = True
                     break
                 time.sleep(0.1)
             if not connected:
-                logger.warning("WS feed failed to connect within 3s, falling back to REST")
+                logger.warning("WS feed failed to connect within 15s, falling back to REST")
                 ws_feed.stop()
                 return self._rest_feed(data_cfg, env, currencies)
             logger.success(f"Data feed: WS (real-time) on {ws_feed.ws_url}")
