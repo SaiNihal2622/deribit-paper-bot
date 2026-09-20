@@ -183,6 +183,20 @@ class DeribitWebSocketFeed:
         self._last_heartbeat = 0.0
         self._tick_count = 0
         self._reconnect_attempts = 0
+        # WS keepalive — a separate daemon thread that sends an
+        # application-level heartbeat (`public/test_request`) every
+        # `_ping_interval_sec` seconds so the socket stays alive even when
+        # no server-pushed ticks are flowing (market closed, low activity
+        # strikes, etc.). Deribit closes idle WSS connections after ~2 min.
+        self._keepalive_thread: Optional[threading.Thread] = None
+        self._last_ping_ts: float = 0.0
+        # 60s keepalive (was 30s). Deribit's idle disconnect happens around
+        # 2 minutes, so 60s gives us 2x safety margin. The lower the interval,
+        # the more pings we send and the more idle CPU + syscalls on the WS
+        # socket, so 60s is a good balance that keeps the connection alive
+        # without burning resources.
+        self._ping_interval_sec: float = 60.0
+        self._ping_interval_sec: float = 30.0
 
     # -----------------------------------------------------------------------
     # Public API — mirrors DeribitFeed
@@ -198,6 +212,11 @@ class DeribitWebSocketFeed:
                 target=self._run_loop, name="deribit-ws", daemon=True
             )
             self._thread.start()
+            self._keepalive_thread = threading.Thread(
+                target=self._keepalive_loop, name="deribit-ws-keepalive",
+                daemon=True,
+            )
+            self._keepalive_thread.start()
             logger.info(
                 f"DeribitWebSocketFeed started (env={self.env}, url={self.ws_url}, "
                 f"currencies={self.currencies}, max_strikes={self.max_strikes_per_underlying})"
@@ -210,7 +229,9 @@ class DeribitWebSocketFeed:
         self._close_ws()
         if self._thread:
             self._thread.join(timeout=3)
-            logger.info("DeribitWebSocketFeed stopped")
+        if self._keepalive_thread:
+            self._keepalive_thread.join(timeout=2)
+        logger.info("DeribitWebSocketFeed stopped")
 
     def subscribe(self, symbols: list[str]) -> None:
         """Add symbols to the subscription set (idempotent).
@@ -494,6 +515,41 @@ class DeribitWebSocketFeed:
                 return
             time.sleep(self.reconnect_delay_sec)
             self._reconnect_attempts += 1
+
+    def _keepalive_loop(self) -> None:
+        """Background thread that sends a `public/test_request` heartbeat to
+        Deribit every `_ping_interval_sec` seconds.
+
+        Without this, Deribit closes the WSS connection after ~2 minutes of
+        no client-initiated traffic (even when server pushes are flowing),
+        which causes a needless reconnect storm every couple of minutes.
+
+        Runs until `_running` flips to False (see stop()).
+        """
+        # Wait for the main loop to connect before starting
+        time.sleep(2.0)
+        while True:
+            with self._lock:
+                if not self._running:
+                    return
+                ws = self._ws
+                connected = self._connected
+            if not connected or ws is None:
+                time.sleep(1.0)
+                continue
+            try:
+                ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "method": "public/test_request",
+                    "id": int(time.time() * 1000) & 0x7FFFFFFF,
+                }))
+                with self._lock:
+                    self._last_ping_ts = time.time()
+            except Exception as e:
+                # Send failed — let the main loop notice the disconnect
+                # on its own; we just sleep and try again next cycle.
+                logger.debug(f"keepalive send failed: {e}")
+            time.sleep(self._ping_interval_sec)
 
     def _should_reconnect(self) -> bool:
         """Decide whether to keep trying after a disconnect."""
