@@ -947,7 +947,7 @@ class PaperRunner:
                 "health_summary": health_summary,
             }
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"_build_idle_context failed: {exc}")
+            logger.warning(f"_build_idle_context failed: {type(exc).__name__}: {exc}")
             return None
 
     def _monitor_targets_stops(self, broker, order_mgr) -> None:
@@ -1168,24 +1168,43 @@ class PaperRunner:
                     not self._cycle_plans_produced
                     and self.trader is not None
                     and self.trader.idle_check_interval_sec > 0
+                    and (
+                        time.time() - self.trader.last_idle_check_at
+                        >= self.trader.idle_check_interval_sec
+                    )
                 ):
                     try:
                         idle_ctx = self._build_idle_context(feed, broker, risk)
-                        if idle_ctx is not None:
-                            idle_decision = self.trader.decide_idle(
-                                signal_context=idle_ctx["signal_context"],
-                                account_state=idle_ctx["account_state"],
-                                health_summary=idle_ctx["health_summary"],
+                        if idle_ctx is None:
+                            logger.warning(
+                                "trader.idle_check: _build_idle_context returned None "
+                                "(feed may be uninitialised)"
                             )
-                            if idle_decision is not None:
-                                self.signal_log.append(
-                                    strategy="idle_check",
-                                    underlying="ALL",
-                                    status=idle_decision.action.value,
-                                    reason=("trader.llm.idle: " + (idle_decision.rationale or "")[:200]),
-                                )
+                            continue
+                        idle_decision = self.trader.decide_idle(
+                            signal_context=idle_ctx["signal_context"],
+                            account_state=idle_ctx["account_state"],
+                            health_summary=idle_ctx["health_summary"],
+                        )
+                        if idle_decision is not None:
+                            logger.info(
+                                "trader.llm.idle: action=" + idle_decision.action.value
+                                + "  qty=" + str(idle_decision.target_qty)
+                                + "  rationale=" + (idle_decision.rationale or "")[:200].replace("\n", " ")
+                            )
+                            self.signal_log.append(
+                                strategy="idle_check",
+                                underlying="ALL",
+                                status=idle_decision.action.value,
+                                reason=("trader.llm.idle: " + (idle_decision.rationale or "")[:200]),
+                            )
+                        else:
+                            logger.warning(
+                                "trader.idle_check: decide_idle returned None "
+                                "(LLM response unparseable or throttle blocked)"
+                            )
                     except Exception as exc:  # noqa: BLE001
-                        logger.debug(f"trader.decide_idle failed: {exc}")
+                        logger.warning(f"trader.idle_check failed: {type(exc).__name__}: {exc}")
 
                 # Per-cycle P&L log (every cycle; not gated by heartbeat)
                 if self._cycle_count - last_pnl_log_cycle >= 1:
