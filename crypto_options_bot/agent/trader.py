@@ -77,10 +77,13 @@ class Trader:
     fallback_enabled: bool = True
     daily_loss_breached: bool = False
     last_decision: Optional[TraderDecision] = None
+    last_idle_check_at: float = 0.0
+    idle_check_interval_sec: float = 1800.0  # 30 min — throttle HOLD-mode LLM calls
     decided_cycles: int = 0
     vetoed_cycles: int = 0
     approved_cycles: int = 0
     fallback_cycles: int = 0
+    idle_checks: int = 0  # how often we asked the LLM "still nothing?" while idle
     model: str = "minimax/MiniMax-M3"
     max_tokens: int = 256
 
@@ -150,6 +153,52 @@ class Trader:
                 "LLM unavailable or budget exceeded; rule-based fallback APPROVE",
                 target_qty=1,
             )
+        return self._record(decision, used_fallback=False)
+
+    # ------------------------------------------------------------------
+    # Idle-mode call (throttled): when no plans produced this cycle,
+    # ask the LLM whether it agrees with staying flat. Generates real
+    # journal entries so the Trader is observably alive even when the
+    # regime gate filters everything out.
+    # ------------------------------------------------------------------
+    def decide_idle(
+        self,
+        *,
+        signal_context: dict[str, Any],
+        account_state: dict[str, Any],
+        health_summary: dict[str, Any],
+        now: Optional[float] = None,
+    ) -> Optional[TraderDecision]:
+        """Throttled LLM check while no plans are produced.
+
+        Returns ``None`` if the throttle window has not elapsed (caller
+        should not log a decision). Returns a ``TraderDecision`` (typically
+        HOLD) when an LLM call actually happens.
+
+        Args:
+            signal_context: latest spot/dvol/iv_rank snapshot.
+            account_state: cash / P&L / positions snapshot.
+            health_summary: from Sentinel.
+            now: epoch seconds; defaults to ``time.time()``. Exposed for
+                testability.
+        """
+        if now is None:
+            now = time.time()
+        if now - self.last_idle_check_at < self.idle_check_interval_sec:
+            return None
+        if self.daily_loss_breached or health_summary.get("bot_alive") is False:
+            return None
+        self.last_idle_check_at = now
+        self.idle_checks += 1
+        decision = self._ask_llm(
+            signal_context=signal_context,
+            candidate_plans=[],
+            account_state=account_state,
+            health_summary=health_summary,
+        )
+        if decision is None:
+            # Don't fabricate — just don't log a decision.
+            return None
         return self._record(decision, used_fallback=False)
 
     # ------------------------------------------------------------------

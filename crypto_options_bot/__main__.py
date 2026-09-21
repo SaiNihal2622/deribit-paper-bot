@@ -268,6 +268,7 @@ class PaperRunner:
         self._last_heartbeat = 0.0
         self._cycle_count = 0
         self._last_plan_at: dict[str, float] = {}  # strategy_name -> ts of last fire
+        self._cycle_plans_produced: bool = False  # reset per cycle; True if anything executed
         self._cooldown_sec = float(cfg.get("strategy", {}).get("cooldown_sec", 300))
         self._first_chain_tick_logged = False
         # Mark-price proxy flag (read once, used in the tick adapter)
@@ -833,6 +834,7 @@ class PaperRunner:
         try:
             order_mgr.execute_plan(plan, qty=target_qty, expiry=expiry_iso)
             self._last_plan_at[name] = time.time()
+            self._cycle_plans_produced = True
         except Exception as e:
             logger.exception(f"execute_plan failed: {e}")
 
@@ -890,6 +892,63 @@ class PaperRunner:
             os.replace(tmp, hb_path)
         except Exception as e:  # noqa: BLE001
             logger.debug(f"heartbeat.json write failed (non-fatal): {e}")
+
+    def _build_idle_context(self, feed, broker, risk):
+        """Build the (signal_context, account_state, health_summary) triple
+        used by ``Trader.decide_idle`` when no plans were produced this cycle.
+        Returns ``None`` if feed data isn't ready.
+        """
+        try:
+            margins = broker.get_margins()
+            positions = broker.get_positions()
+            realized = float(margins.get("realized_pnl", 0.0))
+            unrealized = float(margins.get("unrealized_pnl", 0.0))
+            spot_btc = None
+            spot_eth = None
+            dvol_btc = None
+            dvol_eth = None
+            try:
+                if "BTC" in feed.currencies:
+                    spot_btc = feed.get_ltp("BTC")
+                    dvol_btc = feed.get_dvol("BTC")
+            except Exception:
+                pass
+            try:
+                if "ETH" in feed.currencies:
+                    spot_eth = feed.get_ltp("ETH")
+                    dvol_eth = feed.get_dvol("ETH")
+            except Exception:
+                pass
+            signal_context = {
+                "underlying": "ALL",
+                "spot_btc": spot_btc,
+                "spot_eth": spot_eth,
+                "dvol_btc": dvol_btc,
+                "dvol_eth": dvol_eth,
+                "regime": "low_vol" if (dvol_btc is not None and dvol_btc < 50) else "normal",
+            }
+            account_state = {
+                "cash": float(margins.get("available", 0.0)),
+                "total": float(margins.get("total", 0.0)),
+                "positions": len(positions),
+                "realized_pnl": realized,
+                "unrealized_pnl": unrealized,
+            }
+            risk_status = risk.status() if risk is not None else {}
+            health_summary = {
+                "bot_alive": True,
+                "preset": risk_status.get("preset", "?"),
+                "ws_connected": bool(getattr(feed, "_connected", False)),
+                "open_trades": len(getattr(broker, "_managed_trades", {}) or {}),
+            }
+            return {
+                "signal_context": signal_context,
+                "account_state": account_state,
+                "health_summary": health_summary,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"_build_idle_context failed: {exc}")
+            return None
 
     def _monitor_targets_stops(self, broker, order_mgr) -> None:
         """Auto-close open trades whose combined P&L hits target or stop."""
@@ -1086,6 +1145,7 @@ class PaperRunner:
         try:
             while not self._stop.is_set():
                 self._cycle_count += 1
+                self._cycle_plans_produced = False
                 positions = broker.get_positions()
                 risk.update_open_positions(len(order_mgr.open_trades()))
                 risk.update_daily_pnl(broker._realized_pnl + sum(p.pnl for p in positions))
@@ -1098,6 +1158,34 @@ class PaperRunner:
                         self._process_strategy(strat, ctx, broker, feed, order_mgr, risk)
                 self._monitor_targets_stops(broker, order_mgr)
                 self._heartbeat(broker, order_mgr, feed, risk)
+
+                # Throttled idle-mode LLM check: when nothing was executed this
+                # cycle (e.g. regime gate closed everything), still ask the
+                # Trader LLM whether it agrees with staying flat. Generates a
+                # real decision + journal entry so the agent layer is observably
+                # alive even when no trades occur.
+                if (
+                    not self._cycle_plans_produced
+                    and self.trader is not None
+                    and self.trader.idle_check_interval_sec > 0
+                ):
+                    try:
+                        idle_ctx = self._build_idle_context(feed, broker, risk)
+                        if idle_ctx is not None:
+                            idle_decision = self.trader.decide_idle(
+                                signal_context=idle_ctx["signal_context"],
+                                account_state=idle_ctx["account_state"],
+                                health_summary=idle_ctx["health_summary"],
+                            )
+                            if idle_decision is not None:
+                                self.signal_log.append(
+                                    strategy="idle_check",
+                                    underlying="ALL",
+                                    status=idle_decision.action.value,
+                                    reason=("trader.llm.idle: " + (idle_decision.rationale or "")[:200]),
+                                )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(f"trader.decide_idle failed: {exc}")
 
                 # Per-cycle P&L log (every cycle; not gated by heartbeat)
                 if self._cycle_count - last_pnl_log_cycle >= 1:
