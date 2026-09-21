@@ -94,6 +94,10 @@ class LLMResponse:
     output_tokens: int = 0
     provider: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+    # When logprobs were requested on a chat-completions call, this
+    # holds the choices[0].logprobs block from the response — i.e.
+    # {"content":[{"token":..., "logprob":..., "top_logprobs":[...]}]}
+    logprobs: Optional[dict[str, Any]] = None
 
     @property
     def content(self) -> list[dict[str, str]]:
@@ -409,6 +413,7 @@ class LLMClient:
         temperature: float | None = None,
         extra_headers: dict[str, str] | None = None,
         provider: str | None = None,
+        extra_body: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """Call the LLM via the configured providers.
 
@@ -459,6 +464,7 @@ class LLMClient:
                     max_tokens=max_tokens,
                     temperature=temperature,
                     extra_headers=extra_headers,
+                    extra_body=extra_body,
                 )
                 self._last_good_provider = p.name
                 self._dead_providers.pop(p.name, None)
@@ -513,12 +519,19 @@ class LLMClient:
         max_tokens: int,
         temperature: float | None,
         extra_headers: dict[str, str] | None,
+        extra_body: dict[str, Any] | None = None,
     ) -> LLMResponse:
         assert self._http is not None
         model_id = self._strip_provider(model or provider.model)
         url, body = self._build_request(
             provider, model_id, system, messages, max_tokens, temperature
         )
+        if extra_body:
+            # Merge any caller-supplied body fields (logprobs, top_logprobs,
+            # response_format, etc.). Only chat-completions supports these;
+            # Anthropic messages API will silently ignore extras like
+            # logprobs, which is fine — the caller checks provider support.
+            body.update(extra_body)
         headers = self._build_headers(provider, extra_headers)
 
         for attempt in range(self.max_retries + 1):
@@ -553,6 +566,18 @@ class LLMClient:
             text = self._extract_text(provider, data)
             in_tok, out_tok = self._extract_tokens(provider, data)
             self.budget.charge(in_tok + out_tok)
+            # Extract logprobs block from chat-completions response (if
+            # the provider returned one).
+            logprobs_block: Optional[dict[str, Any]] = None
+            try:
+                if provider.protocol == "chat-completions":
+                    choices = data.get("choices") or []
+                    if choices and isinstance(choices[0], dict):
+                        lp = choices[0].get("logprobs")
+                        if lp:
+                            logprobs_block = lp
+            except (KeyError, IndexError, TypeError):
+                pass
             return LLMResponse(
                 text=text,
                 model=model_id,
@@ -560,6 +585,7 @@ class LLMClient:
                 output_tokens=out_tok,
                 provider=provider.name,
                 raw=data,
+                logprobs=logprobs_block,
             )
 
         raise LLMError(f"[{provider.name}] gave up after {self.max_retries + 1} attempts")

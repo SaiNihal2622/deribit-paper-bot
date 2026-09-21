@@ -116,20 +116,31 @@ class TestIdleGuards:
 
 
 class TestIdleParseFallback:
-    def test_garbled_llm_response_returns_none(self):
-        """If LLM response doesn't parse, decide_idle returns None
-        (rather than fabricating a decision)."""
+    def test_garbled_llm_response_returns_hold_fallback(self):
+        """If LLM response doesn't parse, decide_idle returns a HOLD
+        fallback decision (rather than None) so the idle-check is
+        observably alive even on garbage LLM output. Marked as fallback."""
         t = _make_trader()
-        t.llm.messages.return_value = MagicMock(text="not json, no action line, useless")
+        t.llm.messages.return_value = MagicMock(
+            text="not json, no action line, useless",
+            logprobs=None,
+        )
         d = t.decide_idle(now=100_000.0, **_ctx())
-        assert d is None
-        # Still counted as an attempt
+        assert d is not None
+        assert d.action.value == "hold"
+        assert d.target_qty == 1
+        assert "fallback" in d.rationale.lower()
+        # Throttle still updated + counted as attempt
         assert t.idle_checks == 1
+        assert t.last_idle_check_at == 100_000.0
 
-    def test_llm_exception_returns_none(self):
+    def test_llm_exception_returns_hold_fallback(self):
         t = _make_trader()
         t.llm.messages.side_effect = RuntimeError("provider down")
         d = t.decide_idle(now=100_000.0, **_ctx())
-        assert d is None
+        # Even on exception, we return a fallback decision (not None) so
+        # the trader observably survives transient provider failures.
+        assert d is not None
+        assert d.action.value == "hold"
         # Throttle still updated so we don't hammer a dead provider
         assert t.last_idle_check_at == 100_000.0
