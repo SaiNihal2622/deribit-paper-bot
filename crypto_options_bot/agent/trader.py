@@ -245,6 +245,10 @@ class Trader:
 
         parsed = self._parse_response(resp.text)
         if parsed is None:
+            log.warning(
+                "trader: LLM response unparseable. raw_response=%r",
+                (resp.text or "")[:500],
+            )
             return None
         action_str = (parsed.get("action") or "").lower()
         if action_str not in {a.value for a in TradeAction}:
