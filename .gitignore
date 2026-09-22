@@ -85,3 +85,9 @@ tools/nssm.zip
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Ad-hoc dev scratchpads (created during debug sessions)
+scripts/_test_*
+_*.py
+_*.ps1
+_*.txt

@@ -254,6 +254,7 @@ class PaperRunner:
         pnl_writer: Optional[_PnLWriter] = None,
         signal_log: Optional[_SignalLog] = None,
         trader=None,                # NEW: optional Trader (agent layer) gate
+        recover_orphan: bool = False,
     ):
         self.cfg = cfg
         self.feed_mode = feed_mode  # "ws" or "rest"
@@ -264,6 +265,7 @@ class PaperRunner:
         self.pnl_writer = pnl_writer or _PnLWriter()
         self.signal_log = signal_log or _SignalLog()
         self.trader = trader        # NEW: None = rule-based path only
+        self.recover_orphan = bool(recover_orphan)  # auto-fix journal/broker drift on startup
         self._stop = threading.Event()
         self._signaled_exit: bool = False  # set True by SIGINT/SIGTERM handler
         self._last_heartbeat = 0.0
@@ -429,9 +431,183 @@ class PaperRunner:
             except Exception as e:
                 logger.debug(f"keep_alive_subscribe failed: {e}")
 
+        # Startup reconciliation: detect drift between journal (true history of
+        # all trades) and broker (in-memory positions). If a bot restart lost
+        # broker state but the journal still has open trades, the broker will
+        # think it has 0 positions while the journal has N open. Recover either
+        # automatically (--recover-orphan) or just warn loudly.
+        try:
+            journal_open = len(order_mgr.open_trades())
+            broker_positions = len(broker.get_positions()) if hasattr(broker, "get_positions") else 0
+            if journal_open > 0 and broker_positions == 0:
+                msg = (
+                    f"[STARTUP-DRIFT] journal has {journal_open} open trade(s) but broker "
+                    f"has 0 positions — likely a previous bot restart lost broker state "
+                    f"before paper_state.json was flushed."
+                )
+                if self.recover_orphan:
+                    msg += " --recover-orphan set; rebuilding from journal…"
+                    logger.warning(msg)
+                    if self._recover_orphan(broker, order_mgr):
+                        # Re-check after rebuild
+                        broker_positions = (
+                            len(broker.get_positions())
+                            if hasattr(broker, "get_positions") else 0
+                        )
+                        logger.success(
+                            f"[STARTUP-DRIFT] recovered: broker now has {broker_positions} positions"
+                        )
+                else:
+                    msg += (
+                        " Re-run with --recover-orphan to auto-fix, or run: "
+                        "python scripts/rebuild_broker_positions.py --force"
+                    )
+                    logger.warning(msg)
+            elif journal_open > 0 and broker_positions != journal_open * 2:
+                # Short-strangle → 2 legs per open trade, so broker ~= 2 × journal_open.
+                # If that ratio doesn't hold, there's drift worth logging but maybe not
+                # auto-fixing (could be from partial fills or closures).
+                logger.info(
+                    f"[STARTUP-CHECK] journal_open={journal_open} broker_positions="
+                    f"{broker_positions} (expect ~{journal_open * 2} for full strangle coverage)"
+                )
+            else:
+                logger.info(
+                    f"[STARTUP-CHECK] journal_open={journal_open} broker_positions="
+                    f"{broker_positions} — clean"
+                )
+        except Exception as e:
+            logger.debug(f"startup reconcile check failed: {e}")
+
         # wire trade events: alerter + pnl telemetry
         order_mgr.set_event_callback(self._on_trade_event)
         return broker, feed, order_mgr, risk
+
+    def _recover_orphan(self, broker, order_mgr) -> bool:
+        """Re-derive broker._positions from the trade journal and persist.
+
+        Mirrors scripts/rebuild_broker_positions.py but runs inline so the live
+        bot picks up the rebuilt state immediately (no restart needed). Returns
+        True on success.
+        """
+        try:
+            trades_path = Path(getattr(order_mgr, "persist_path", "data_cache/trades_state.json"))
+            paper_path = Path(getattr(broker, "persist_path", "data_cache/paper_state.json"))
+            if not trades_path.exists():
+                logger.warning(f"[recover_orphan] no {trades_path}")
+                return False
+
+            trades_state = json.loads(trades_path.read_text(encoding="utf-8"))
+            trades = trades_state.get("trades", {}) or {}
+
+            # Aggregate per-symbol net qty + VWAP fill price across COMPLETE orders
+            # in OPEN trades only (closed trades already unwound themselves).
+            agg: dict[str, dict] = {}
+            for tid, td in trades.items():
+                if td.get("closed_at"):
+                    continue
+                for od in td.get("orders", []) or []:
+                    # OrderStatus enum values are lowercase: "complete", "open", etc.
+                    # Be tolerant of case to handle older journals.
+                    if str(od.get("status", "")).strip().lower() != "complete":
+                        continue
+                    sym = od.get("symbol")
+                    if not sym:
+                        continue
+                    side = od.get("side", "BUY")
+                    qty = float(od.get("filled_qty") or od.get("qty") or 0)
+                    avg = float(od.get("avg_fill_price") or 0)
+                    if sym not in agg:
+                        agg[sym] = {
+                            "qty": 0.0,
+                            "notional": 0.0,
+                            "strike": od.get("strike"),
+                            "option_type": od.get("option_type"),
+                            "expiry": od.get("expiry"),
+                            "underlying": od.get("underlying"),
+                            "exchange": od.get("exchange", "DERIBIT"),
+                            "entry_time": td.get("opened_at"),
+                        }
+                    sign = 1.0 if side.upper().startswith("B") else -1.0
+                    agg[sym]["qty"] += sign * qty
+                    agg[sym]["notional"] += sign * qty * avg
+
+            positions: dict[str, dict] = {}
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for sym, a in agg.items():
+                if abs(a["qty"]) < 1e-9:
+                    continue
+                avg_price = round(a["notional"] / a["qty"], 6) if a["qty"] != 0 else 0.0
+                positions[sym] = {
+                    "symbol": sym,
+                    "qty": int(round(a["qty"])),
+                    "avg_price": avg_price,
+                    "ltp": avg_price,
+                    "exchange": a["exchange"] or "DERIBIT",
+                    "pnl": 0.0,
+                    "strike": a["strike"],
+                    "option_type": a["option_type"],
+                    "expiry": a["expiry"],
+                    "underlying": a["underlying"],
+                    "contract_size": 1.0,
+                    "entry_time": a["entry_time"] or now_iso,
+                }
+
+            # Mutate broker in-memory state directly (broker._load_state was
+            # already called at construction; we mirror that contract here).
+            try:
+                broker._positions.clear()
+                for sym, pd_dict in positions.items():
+                    from .broker.base import Position
+                    pos = Position(
+                        symbol=pd_dict["symbol"],
+                        qty=pd_dict["qty"],
+                        avg_price=pd_dict["avg_price"],
+                        ltp=pd_dict["ltp"],
+                        exchange=pd_dict["exchange"],
+                        pnl=pd_dict["pnl"],
+                        strike=pd_dict["strike"],
+                        option_type=pd_dict["option_type"],
+                        expiry=pd_dict["expiry"],
+                        underlying=pd_dict["underlying"],
+                        contract_size=pd_dict["contract_size"],
+                        entry_time=pd_dict["entry_time"],
+                    )
+                    broker._positions[sym] = pos
+                # Persist the rebuilt state immediately
+                broker._save_state()
+            except Exception as inner:
+                # Last-resort: write paper_state.json directly if broker
+                # internals aren't accessible.
+                logger.warning(
+                    f"[recover_orphan] broker-direct update failed ({inner}); "
+                    f"falling back to direct file write"
+                )
+                paper_state = {
+                    "cash": getattr(broker, "_cash", 100_000.0),
+                    "realized_pnl": getattr(broker, "_realized_pnl", 0.0),
+                    "orders": {},
+                    "positions": positions,
+                }
+                if paper_path.exists():
+                    tmp = paper_path.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(paper_state, indent=2, default=str), encoding="utf-8")
+                    os.replace(tmp, paper_path)
+                else:
+                    paper_path.parent.mkdir(parents=True, exist_ok=True)
+                    paper_path.write_text(json.dumps(paper_state, indent=2, default=str), encoding="utf-8")
+
+            logger.success(
+                f"[recover_orphan] derived {len(positions)} position(s) from journal:"
+            )
+            for sym, pd_dict in positions.items():
+                logger.success(
+                    f"  {sym:32s} qty={pd_dict['qty']:+d} avg={pd_dict['avg_price']:.4f}"
+                )
+            return True
+        except Exception as e:
+            logger.exception(f"[recover_orphan] failed: {e}")
+            return False
 
     def _on_trade_event(self, event: str, trade) -> None:
         """Callback from OrderManager — invoked when a trade is opened/closed."""
@@ -1429,6 +1605,7 @@ def cmd_paper(args) -> int:
         mode="paper", alerter=alerter, dashboard=dashboard,
         pnl_writer=pnl_writer, signal_log=signal_log,
         trader=False if getattr(args, "no_trader", False) else None,
+        recover_orphan=bool(getattr(args, "recover_orphan", False)),
     )
     if args.max_runtime:
         def _stop_after():
@@ -1500,6 +1677,7 @@ def cmd_live(args) -> int:
         mode="live", alerter=alerter, dashboard=dashboard,
         pnl_writer=pnl_writer, signal_log=signal_log,
         trader=False if getattr(args, "no_trader", False) else None,
+        recover_orphan=bool(getattr(args, "recover_orphan", False)),
     )
     if args.max_runtime:
         def _stop_after():
@@ -1591,6 +1769,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-trader", action="store_true",
         help="Disable the Trader LLM gate; rule-based path only.",
     )
+    p_paper.add_argument(
+        "--recover-orphan", action="store_true",
+        help="On startup, if journal has open trades but broker has 0 positions, "
+             "rebuild broker positions from the journal automatically.",
+    )
     p_paper.set_defaults(func=cmd_paper)
 
     p_live = sub.add_parser("live", help="Run a LIVE trading session (safety guard required)")
@@ -1602,6 +1785,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Disable the Trader LLM gate; rule-based path only.",
     )
     p_live.add_argument("--dashboard-port", type=int, default=None)
+    p_live.add_argument(
+        "--recover-orphan", action="store_true",
+        help="On startup, if journal has open trades but broker has 0 positions, "
+             "rebuild broker positions from the journal automatically.",
+    )
     p_live.set_defaults(func=cmd_live)
 
     p_status = sub.add_parser("status", help="Print current paper state")
