@@ -743,10 +743,34 @@ class PaperRunner:
         if plan is None:
             return
 
+        # Resolve the nearest expiry as ISO date ONCE, before dedupe. We need
+        # this both for the dedupe symbol comparison and for the actual order
+        # placement downstream. NOTE: TradePlan.expiry defaults to "" and the
+        # short_strangle strategy does NOT set it (see short_strangle.py), so
+        # reading plan.expiry here would always give "" and the dedupe would
+        # silently no-op. Compute it from the feed directly.
+        ddmmyy = feed.get_nearest_expiry(ctx.underlying)
+        expiry_iso = ""
+        if ddmmyy:
+            try:
+                d_str = ddmmyy[0:2]
+                m_str = ddmmyy[2:5]
+                y_str = ddmmyy[5:7]
+                _MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                           "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+                expiry_iso = date(2000 + int(y_str), _MONTHS[m_str], int(d_str)).isoformat()
+            except Exception:
+                expiry_iso = ""
+        plan.expiry = expiry_iso
+
         # DEDUPE: skip if any open trade already has the same strike+type
         # for the same underlying. Without this, the same short_strangle
         # fires every cooldown (5 min) and accumulates 3-6 identical
         # positions in a session. See issue: 2026-09-22 triple strangle.
+        #
+        # Both sides of the comparison use the SAME expiry source (expiry_iso
+        # computed above) and the SAME canonical Deribit symbol format
+        # "DDMMMYY" (e.g. "23SEP26") so the strings actually match.
         try:
             cur_open = order_mgr.open_trades()
             cur_symbols = set()
@@ -755,22 +779,20 @@ class PaperRunner:
                     if getattr(o, "underlying", "") == ctx.underlying:
                         cur_symbols.add(str(o.symbol))
             new_symbols = set()
-            for leg in plan.legs:
-                strike = int(leg.get("strike", 0))
-                opt = leg.get("opt_type", "?")
-                side = leg.get("side", "?")
-                exp = plan.expiry
-                if strike and exp:
-                    # Convert ISO date "2026-09-23" to canonical broker symbol
-                    # format "23SEP26" matching Deribit's symbol convention.
-                    try:
-                        exp_date = date.fromisoformat(exp)
-                        exp_canonical = exp_date.strftime("%d%b%y").upper()
-                    except (ValueError, TypeError):
-                        exp_canonical = exp.replace("-", "")
-                    new_symbols.add(
-                        f"{ctx.underlying}-{exp_canonical}-{strike}-{opt}"
+            if expiry_iso:
+                try:
+                    exp_canonical = (
+                        date.fromisoformat(expiry_iso).strftime("%d%b%y").upper()
                     )
+                except (ValueError, TypeError):
+                    exp_canonical = expiry_iso.replace("-", "")
+                for leg in plan.legs:
+                    strike = int(leg.get("strike", 0))
+                    opt = leg.get("opt_type", "?")
+                    if strike:
+                        new_symbols.add(
+                            f"{ctx.underlying}-{exp_canonical}-{strike}-{opt}"
+                        )
             dup = new_symbols & cur_symbols
             if dup:
                 logger.info(
@@ -789,21 +811,6 @@ class PaperRunner:
             f"{leg.get('side','?')}{leg.get('opt_type','?')}{int(leg.get('strike',0))}"
             for leg in plan.legs
         )
-
-        # nearest expiry as ISO date
-        ddmmyy = feed.get_nearest_expiry(ctx.underlying)
-        expiry_iso = ""
-        if ddmmyy:
-            try:
-                d_str = ddmmyy[0:2]
-                m_str = ddmmyy[2:5]
-                y_str = ddmmyy[5:7]
-                _MONTHS = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
-                           "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-                expiry_iso = date(2000 + int(y_str), _MONTHS[m_str], int(d_str)).isoformat()
-            except Exception:
-                expiry_iso = ""
-        plan.expiry = expiry_iso
 
         # risk check
         decision = risk.check_trade(plan, account_state=account_state)

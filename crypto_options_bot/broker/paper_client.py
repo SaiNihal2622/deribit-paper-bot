@@ -468,24 +468,48 @@ class PaperClient(BrokerClient):
                         pd[k] = v.isoformat()
             tmp = self.persist_path.with_suffix(".tmp")
             json_text = json.dumps(state, indent=2, default=str, ensure_ascii=False)
-            for attempt in range(3):
+            # Use a unique tmp filename to avoid collisions when two bot
+            # processes (or the bot + a status CLI) race on the same path.
+            # On Windows the leftover .tmp from a crashed prior save can
+            # also trigger AV scans during the rename — that's where the
+            # PermissionError used to come from.
+            import os, tempfile
+            unique_tmp = self.persist_path.parent / (
+                f".paper_state.{os.getpid()}.{int(time.time() * 1000) % 100000}.tmp"
+            )
+            for attempt in range(5):
                 try:
-                    tmp.write_text(json_text, encoding="utf-8")
+                    unique_tmp.write_text(json_text, encoding="utf-8")
                     if self.persist_path.exists():
-                        import os
-                        os.replace(tmp, self.persist_path)
+                        os.replace(unique_tmp, self.persist_path)
                     else:
-                        tmp.replace(self.persist_path)
+                        unique_tmp.replace(self.persist_path)
+                    # Best-effort cleanup of any stale .tmp from a prior crash.
+                    try:
+                        if tmp.exists() and tmp != unique_tmp:
+                            tmp.unlink()
+                    except OSError:
+                        pass
                     return
-                except (PermissionError, OSError):
-                    if attempt < 2:
-                        time.sleep(0.05 * (attempt + 1))
+                except (PermissionError, OSError) as e:
+                    if attempt < 4:
+                        time.sleep(0.1 * (attempt + 1))
                     else:
+                        # Last-ditch fallback: try the legacy fixed-name tmp
+                        # path in case unique_tmp is the one being scanned.
                         try:
-                            self.persist_path.write_text(json_text, encoding="utf-8")
+                            tmp.write_text(json_text, encoding="utf-8")
+                            if self.persist_path.exists():
+                                os.replace(tmp, self.persist_path)
+                            else:
+                                tmp.replace(self.persist_path)
                             return
                         except Exception:
-                            raise
+                            try:
+                                self.persist_path.write_text(json_text, encoding="utf-8")
+                                return
+                            except Exception:
+                                raise e
         except Exception as e:
             logger.warning(f"PaperClient state save failed: {e}")
 
