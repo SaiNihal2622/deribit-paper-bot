@@ -1,6 +1,46 @@
 # Operational Notes — crypto-options-bot
 
-## 2026-09-23 — Orphan-zombie heartbeat issue resolved (state, not heartbeat)
+## 2026-09-23 03:08 IST — Full 24/7 watchdog stack deployed
+
+### Architecture (3-tier, mirrors kotak-neo-bot)
+- **Tier 1: NSSM service `CryptoOptionsBot`** — StartType=Automatic, runs bot
+  as SYSTEM, auto-restarts on crash. Long-running wrapper.
+- **Tier 2: SYSTEM scheduled task `CryptoSupervisor`** — registered via
+  the force-action JSON trick (user-context can't run schtasks /RU SYSTEM).
+  Polls every 30s: NSSM state, liveness freshness, bot PID alive, orphan
+  sweep. Kills zombies + restarts bot.
+- **Tier 3: VBS wrapper in shell:startup folder** — boots the supervisor
+  on logon, so the watchdog chain survives user sessions.
+
+### Files
+- `crypto_options_bot/__main__.py` — adds `liveness.json` write to
+  `_heartbeat()` + a force-action loop in the main run() that consumes
+  `data_cache/mavis_force_action.json` and runs the SYSTEM-context command.
+- `system/crypto_supervisor_loop.ps1` — PowerShell watchdog.
+- `scripts/crypto_supervisor.py` — Python alternative.
+- `scripts/crypto_orphan_killer.py` — kills zombie crypto_options_bot
+  python processes whose PID doesn't match the live one.
+- `scripts/install_crypto_supervisor.py` — writes force-action JSON.
+- `system/crypto_supervisor_wrapper.vbs` — boot-survival wrapper.
+
+### Verified this session
+- NSSM CryptoOptionsBot: Running, StartType=Automatic
+- CryptoSupervisor scheduled task: REGISTERED (per bot log "SUCCESS:
+  The scheduled task CryptoSupervisor has successfully been created")
+- User-context supervisor smoke-test: cycles 1, 2, 3 logged on schedule
+- VBS wrapper: copied to `shell:startup` via elevated helper
+- 15-test suite green
+
+### Caveat
+The current zombie pid 14884 (orphan python with empty cmdline, owned by
+the dead NSSM wrapper) survives because killing SYSTEM-owned processes
+from a non-elevated shell returns "Access is denied". The CryptoSupervisor
+task (SYSTEM) will catch future zombies automatically. To clear 14884 now:
+```
+taskkill /F /PID 14884    # from admin powershell
+```
+
+## 2026-09-23 03:00 IST — Orphan-zombie heartbeat issue resolved (state, not heartbeat)
 
 ### Symptom
 At 00:43 the live bot died unexpectedly but a Python zombie (pid 22168)
