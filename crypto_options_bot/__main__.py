@@ -300,6 +300,49 @@ class PaperRunner:
         # Per-(currency, reason) timestamp of last "REGIME GATE engaged" log
         # so we don't spam when the gate is closed for hours.
         self._regime_gate_last_log: dict[tuple[str, str], float] = {}
+        # Hot-reload: track the last time we read settings.yaml so we can
+        # re-read it when the file changes. This lets DVOL floors, iv_rank
+        # floors, and other knobs be tuned without restarting the bot.
+        self._settings_yaml_path = "config/settings.yaml"
+        self._settings_yaml_mtime: float = 0.0
+
+    def _maybe_reload_config(self) -> None:
+        """Reload regime gate thresholds from settings.yaml when the file changes.
+
+        Cheap to call every cycle (just a stat + dict compare). Lets the user
+        tune DVOL / iv_rank / cooldown floors without restarting the bot.
+        """
+        try:
+            p = Path(self._settings_yaml_path)
+            if not p.exists():
+                return
+            mtime = p.stat().st_mtime
+            if mtime == self._settings_yaml_mtime:
+                return
+            self._settings_yaml_mtime = mtime
+            cfg = load_config(self._settings_yaml_path)
+            rg_cfg = cfg.get("data", {}).get("iv_regime_gate", {}) or {}
+            self._regime_gate_enabled = bool(rg_cfg.get("enabled", self._regime_gate_enabled))
+            self._regime_gate_log_cooldown_sec = float(
+                rg_cfg.get("log_cooldown_sec", self._regime_gate_log_cooldown_sec)
+            )
+            self._cooldown_sec = float(
+                cfg.get("strategy", {}).get("cooldown_sec", self._cooldown_sec)
+            )
+            for cur in ("BTC", "ETH"):
+                cur_cfg = rg_cfg.get(cur, {}) or {}
+                self._regime_gate_thresholds[cur] = (
+                    float(cur_cfg.get("min_dvol", self._regime_gate_thresholds.get(cur, (50.0, 40.0))[0])),
+                    float(cur_cfg.get("min_iv_rank", self._regime_gate_thresholds.get(cur, (50.0, 40.0))[1])),
+                )
+            logger.info(
+                "config reloaded: cooldown=%.0fs  regime_gate=%s  thresholds=%s",
+                self._cooldown_sec,
+                "enabled" if self._regime_gate_enabled else "disabled",
+                self._regime_gate_thresholds,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"config reload failed (using cached values): {e}")
 
     def _make_verbose_tick_callback(self) -> callable:
         """Return a tick callback that logs each tick at INFO if --verbose."""
@@ -699,6 +742,38 @@ class PaperRunner:
         if plan is None:
             return
 
+        # DEDUPE: skip if any open trade already has the same strike+type
+        # for the same underlying. Without this, the same short_strangle
+        # fires every cooldown (5 min) and accumulates 3-6 identical
+        # positions in a session. See issue: 2026-09-22 triple strangle.
+        try:
+            cur_open = order_mgr.open_trades()
+            cur_symbols = set()
+            for t in cur_open:
+                for o in t.orders:
+                    if getattr(o, "underlying", "") == ctx.underlying:
+                        cur_symbols.add(str(o.symbol))
+            new_symbols = set()
+            for leg in plan.legs:
+                strike = int(leg.get("strike", 0))
+                opt = leg.get("opt_type", "?")
+                side = leg.get("side", "?")
+                exp = plan.expiry
+                if strike and exp:
+                    new_symbols.add(f"{ctx.underlying}-{exp.replace('-','')}-{strike}-{opt}")
+            dup = new_symbols & cur_symbols
+            if dup:
+                logger.info(
+                    f"[{name}] skipped: dedupe — already holding {sorted(dup)}"
+                )
+                self.signal_log.append(
+                    strategy=name, underlying=ctx.underlying,
+                    status="rejected", reason=f"dedupe: already holding {sorted(dup)}",
+                )
+                return
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"dedupe check failed (proceeding): {e}")
+
         # Stash a snapshot of legs for the signal log (so we know what fired)
         legs_summary = " ".join(
             f"{leg.get('side','?')}{leg.get('opt_type','?')}{int(leg.get('strike',0))}"
@@ -951,13 +1026,40 @@ class PaperRunner:
             return None
 
     def _monitor_targets_stops(self, broker, order_mgr) -> None:
-        """Auto-close open trades whose combined P&L hits target or stop."""
+        """Auto-close open trades whose combined P&L hits target or stop,
+        OR whose expiry has already passed."""
         positions = broker.get_positions()
         pos_pnl = {p.symbol: float(p.pnl) for p in positions}
+        today = date.today()
         for trade in list(order_mgr.open_trades()):
             plan = trade.plan
             if not plan:
                 continue
+
+            # Expiry auto-close: if the trade's expiry has passed, close
+            # it with reason="expired". Without this, expired Sep 18 trades
+            # stay "open" in journal forever, inflating the position cap.
+            expiry_iso = getattr(plan, "expiry", None) or ""
+            if expiry_iso:
+                try:
+                    exp_date = date.fromisoformat(expiry_iso)
+                    if exp_date < today:
+                        logger.info(
+                            f"[monitor] trade {trade.trade_id} expired on "
+                            f"{expiry_iso}, auto-closing"
+                        )
+                        try:
+                            order_mgr.close_trade(
+                                trade.trade_id, reason="expired"
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            logger.exception(
+                                f"close_trade(expired={trade.trade_id}) failed: {e}"
+                            )
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
             leg_pnl = 0.0
             for order in trade.orders:
                 if order.symbol in pos_pnl:
@@ -1145,6 +1247,9 @@ class PaperRunner:
         try:
             while not self._stop.is_set():
                 self._cycle_count += 1
+                # Hot-reload settings.yaml when the file changes. Lets us
+                # tune regime gate floors, cooldowns, etc. without restart.
+                self._maybe_reload_config()
                 self._cycle_plans_produced = False
                 positions = broker.get_positions()
                 risk.update_open_positions(len(order_mgr.open_trades()))
