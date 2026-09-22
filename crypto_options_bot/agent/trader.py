@@ -64,6 +64,217 @@ def _safe_json(text: str) -> Any:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Six-judgment state (buber's TypeSafe/Jev-inspired pattern)
+# ---------------------------------------------------------------------------
+# Instead of asking the LLM for a single action, we ask it to answer six
+# ATOMIC questions about the state. Each is a typed `choice` with a fixed
+# allowed set. The LLM never picks the trade action directly — code does,
+# via a deterministic policy aggregator. This:
+#   - shrinks reasoning variance (model can't overfit one yes/no judgement)
+#   - makes the policy auditable (thresholds live in code, not prompts)
+#   - enables calibration — we can score each judgement against realised
+#     outcomes and re-tune the aggregator
+#
+# Inspired by buberlo/jev-trader's "feature engine -> <400-token state ->
+# 6 atomic Jev judgements -> policy engine" architecture.
+# ---------------------------------------------------------------------------
+VALID_REGIMES = {
+    "trending_up", "trending_down", "range", "volatile_high", "quiet_low",
+}
+VALID_DIRECTIONS = {"bullish", "bearish", "neutral"}
+VALID_TOXIC_FLOW = {"low", "normal", "high"}
+VALID_LIQUIDITY_STRESSED = {"no", "partial", "yes"}
+VALID_QUOTE_ENV = {"favorable", "normal", "unfavorable"}
+VALID_INVENTORY_PRESSURE = {"no_pressure", "long_bias", "short_bias"}
+
+
+@dataclass
+class SixJudgments:
+    """Six atomic judgements from the LLM over the current state."""
+
+    regime: str               # trending_up | trending_down | range | volatile_high | quiet_low
+    direction: str            # bullish | bearish | neutral
+    toxic_flow: str           # low | normal | high
+    liquidity_stressed: str   # no | partial | yes
+    quote_environment: str    # favorable | normal | unfavorable
+    inventory_pressure: str   # no_pressure | long_bias | short_bias
+    rationale: str = ""
+
+    def is_valid(self) -> bool:
+        return (
+            self.regime in VALID_REGIMES
+            and self.direction in VALID_DIRECTIONS
+            and self.toxic_flow in VALID_TOXIC_FLOW
+            and self.liquidity_stressed in VALID_LIQUIDITY_STRESSED
+            and self.quote_environment in VALID_QUOTE_ENV
+            and self.inventory_pressure in VALID_INVENTORY_PRESSURE
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "regime": self.regime,
+            "direction": self.direction,
+            "toxic_flow": self.toxic_flow,
+            "liquidity_stressed": self.liquidity_stressed,
+            "quote_environment": self.quote_environment,
+            "inventory_pressure": self.inventory_pressure,
+            "rationale": self.rationale,
+        }
+
+
+def aggregate_judgments(
+    j: SixJudgments, plan_qty: int = 1
+) -> TraderDecision:
+    """Deterministic policy: 6 atomic judgements → 1 trade action.
+
+    Pure code, easy to test, easy to A/B. Adjust thresholds HERE, not in
+    the prompt — that's the whole point of the buber's "judges, code
+    executes" architecture.
+
+    Args:
+        j: parsed six judgements
+        plan_qty: candidate plan's qty (for cap on APPROVE)
+
+    Returns:
+        TraderDecision with action + sized target_qty + concise rationale.
+    """
+    # Tier 1 — hard vetoes (any single "yes" means no trade)
+    if j.toxic_flow == "high":
+        return TraderDecision(
+            TradeAction.VETO,
+            "toxic_flow=high — informed flow active; no edge for short vol",
+            target_qty=0,
+        )
+    if j.liquidity_stressed == "yes":
+        return TraderDecision(
+            TradeAction.VETO,
+            "liquidity_stressed=yes — strikes too illiquid to enter",
+            target_qty=0,
+        )
+    if j.regime == "volatile_high" and j.direction == "neutral":
+        return TraderDecision(
+            TradeAction.VETO,
+            "volatile regime, no directional conviction — short vol picks up tail risk",
+            target_qty=0,
+        )
+
+    # Tier 2 — reasons to DOWNSIZE
+    downsize_reasons: list[str] = []
+    if j.quote_environment == "unfavorable":
+        downsize_reasons.append("quote_env=unfavorable")
+    if j.inventory_pressure != "no_pressure":
+        downsize_reasons.append(f"inventory={j.inventory_pressure}")
+    if j.liquidity_stressed == "partial":
+        downsize_reasons.append("liquidity_stressed=partial")
+    if j.regime in {"trending_up", "trending_down"}:
+        downsize_reasons.append(f"regime={j.regime}")
+    if j.regime == "volatile_high":
+        downsize_reasons.append("regime=volatile_high")
+    if j.toxic_flow == "normal":
+        downsize_reasons.append("toxic_flow=normal")
+
+    if downsize_reasons:
+        return TraderDecision(
+            TradeAction.DOWNSIZE,
+            "downsize: " + "; ".join(downsize_reasons),
+            target_qty=min(1, plan_qty),
+            raw=j.to_dict(),
+        )
+
+    # Tier 3 — clean short-vol setup
+    if (
+        j.regime in {"range", "quiet_low"}
+        and j.direction == "neutral"
+        and j.quote_environment in {"favorable", "normal"}
+        and j.liquidity_stressed == "no"
+        and j.toxic_flow == "low"
+    ):
+        return TraderDecision(
+            TradeAction.APPROVE,
+            "clean range/quiet setup: regime={} dir=neutral quotes={}".format(
+                j.regime, j.quote_environment
+            ),
+            target_qty=max(1, plan_qty),
+            raw=j.to_dict(),
+        )
+
+    # Tier 4 — mixed/uncertain signals: small approval
+    return TraderDecision(
+        TradeAction.DOWNSIZE,
+        "mixed signals: regime={} dir={} quotes={}".format(
+            j.regime, j.direction, j.quote_environment
+        ),
+        target_qty=1,
+        raw=j.to_dict(),
+    )
+
+
+def _parse_six_judgments(text: str) -> Optional[SixJudgments]:
+    """Tolerant parser: extract six atomic judgements from LLM JSON.
+
+    Handles the same quirks as _parse_response (``` fences, prose, single
+    quotes) — but reads the six-judgement schema, not the single-action
+    schema.
+    """
+    if not text:
+        return None
+    text = text.strip()
+    if not text:
+        return None
+
+    def _coerce(d: Any) -> Optional[SixJudgments]:
+        if not isinstance(d, dict):
+            return None
+        try:
+            j = SixJudgments(
+                regime=str(d.get("regime", "")).strip().lower(),
+                direction=str(d.get("direction", "")).strip().lower(),
+                toxic_flow=str(d.get("toxic_flow", "")).strip().lower(),
+                liquidity_stressed=str(d.get("liquidity_stressed", "")).strip().lower(),
+                quote_environment=str(d.get("quote_environment", "")).strip().lower(),
+                inventory_pressure=str(d.get("inventory_pressure", "")).strip().lower(),
+                rationale=str(d.get("rationale", ""))[:500],
+            )
+        except Exception:
+            return None
+        return j if j.is_valid() else None
+
+    # 1. Strip optional ``` fences and try direct parse.
+    for prefix in ("```json\n", "```JSON\n", "```\n", "```"):
+        if text.startswith(prefix):
+            stripped = text[len(prefix):]
+            if stripped.endswith("```"):
+                stripped = stripped[:-3].rstrip()
+            parsed = _coerce(_safe_json(stripped))
+            if parsed is not None:
+                return parsed
+
+    # 2. Whole text is JSON-ish.
+    parsed = _coerce(_safe_json(text))
+    if parsed is not None:
+        return parsed
+
+    # 3. Find first balanced {...} block.
+    idx = text.find("{")
+    if idx >= 0:
+        depth = 0
+        for end in range(idx, len(text)):
+            ch = text[end]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[idx:end + 1]
+                    parsed = _coerce(_safe_json(candidate))
+                    if parsed is not None:
+                        return parsed
+                    break
+
+    return None
+
+
 class TradeAction(str, Enum):
     APPROVE = "approve"
     VETO = "veto"
@@ -109,8 +320,10 @@ class Trader:
     approved_cycles: int = 0
     fallback_cycles: int = 0
     idle_checks: int = 0  # how often we asked the LLM "still nothing?" while idle
+    six_judgment_cycles: int = 0  # cycles resolved via 6-judgment path
     model: str = "minimax/MiniMax-M3"
     max_tokens: int = 256
+    six_judgment_max_tokens: int = 350  # 6 fields + rationale = a bit more than single action
 
     def __post_init__(self) -> None:
         self.project_root = Path(self.project_root).resolve()
@@ -119,6 +332,13 @@ class Trader:
         )
         self.decision_prompt_path = (
             self.project_root / "crypto_options_bot" / "agent" / "prompts" / "trader_decision.md"
+        )
+        self.six_judgment_prompt_path = (
+            self.project_root
+            / "crypto_options_bot"
+            / "agent"
+            / "prompts"
+            / "trader_six_judgment.md"
         )
         # Action tokens used for constrained-decision probing on
         # OpenAI-compatible providers that expose logprobs (openrouter,
@@ -180,6 +400,17 @@ class Trader:
                 TraderDecision(TradeAction.VETO, "bot_alive=False; deferring to Healer"),
                 used_fallback=False,
             )
+
+        # 2a. Six-judgment path (TypeSafe Jev-inspired). The LLM only
+        # answers six atomic questions; code aggregates to a decision.
+        # Falls back to the legacy single-action path on any parse error.
+        six_decision = self._decide_six_judgment(
+            signal_context, candidate_plans, account_state
+        )
+        if six_decision is not None:
+            self.six_judgment_cycles += 1
+            return self._record(six_decision, used_fallback=False)
+        log.info("trader: six-judgment path produced no decision; using legacy single-action LLM")
 
         # 2. Ask the LLM.
         decision = self._ask_llm(signal_context, candidate_plans, account_state, health_summary)
@@ -429,6 +660,94 @@ class Trader:
             return {"action": first_token, "rationale": text[:400], "target_qty": 1}
 
         return None
+
+    # ------------------------------------------------------------------
+    # Six-judgment path (NEW 2026-09-22, buberlo/jev-trader inspired)
+    # ------------------------------------------------------------------
+    # One LLM call returns six atomic judgements about the state. The
+    # deterministic `aggregate_judgments` function combines them into a
+    # TraderDecision. If the LLM response fails to parse, the caller
+    # falls back to the legacy single-action path.
+    def _decide_six_judgment(
+        self,
+        signal_context: dict[str, Any],
+        candidate_plans: list[dict[str, Any]],
+        account_state: dict[str, Any],
+    ) -> Optional[TraderDecision]:
+        try:
+            judgments = self._ask_six_judgments(
+                signal_context=signal_context,
+                candidate_plans=candidate_plans,
+                account_state=account_state,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info("trader.six_judgment: call failed: %s", exc)
+            return None
+        if judgments is None:
+            return None
+        # Use the candidate plan's qty as the cap for APPROVE sizing.
+        plan_qty = 1
+        try:
+            for p in candidate_plans:
+                q = int(p.get("qty") or 1)
+                plan_qty = max(plan_qty, q)
+        except Exception:
+            plan_qty = 1
+        decision = aggregate_judgments(judgments, plan_qty=plan_qty)
+        # Tag the rationale so log readers can see which mode produced it.
+        return TraderDecision(
+            action=decision.action,
+            rationale="[6j] " + decision.rationale,
+            target_qty=decision.target_qty,
+            raw=decision.raw,
+        )
+
+    def _ask_six_judgments(
+        self,
+        *,
+        signal_context: dict[str, Any],
+        candidate_plans: list[dict[str, Any]],
+        account_state: dict[str, Any],
+    ) -> Optional[SixJudgments]:
+        """One LLM call, six atomic judgements in JSON. Returns parsed
+        SixJudgments or None on any error / invalid response.
+        """
+        try:
+            system_prompt = self._load_prompt(self.system_prompt_path)
+            decision_template = self._load_prompt(self.six_judgment_prompt_path)
+        except FileNotFoundError:
+            return None
+
+        ctx_payload = json.dumps(
+            {
+                "signal_context": signal_context,
+                "candidate_plans": candidate_plans,
+                "account_state": account_state,
+            },
+            default=str,
+            indent=2,
+        )[:8000]
+        user_prompt = decision_template.replace("{{CONTEXT}}", ctx_payload)
+
+        try:
+            resp: LLMResponse = self.llm.messages(
+                model=self.model,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                max_tokens=self.six_judgment_max_tokens,
+                temperature=0.2,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info("trader.six_judgment: LLM call failed: %s", exc)
+            return None
+
+        parsed = _parse_six_judgments(resp.text or "")
+        if parsed is None:
+            log.info(
+                "trader.six_judgment: invalid response. raw=%r",
+                (resp.text or "")[:400],
+            )
+        return parsed
 
     # ------------------------------------------------------------------
     # Constrained-decision path (OpenJev-style)
