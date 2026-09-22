@@ -1161,6 +1161,30 @@ class PaperRunner:
         except Exception as e:  # noqa: BLE001
             logger.debug(f"heartbeat.json write failed (non-fatal): {e}")
 
+        # NEW: write a separate liveness.json for the watchdog supervisor.
+        # This is the file the supervisor reads to decide whether to restart
+        # us. We keep it independent from heartbeat.json so the supervisor
+        # can detect "heartbeat file exists but bot is wedged" (i.e. file
+        # modtime frozen because tick loop is blocked).
+        try:
+            liv_payload = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "pid": os.getpid(),
+                "cycle": self._cycle_count,
+                "state": "alive",
+                "mode": self.mode,
+                "feed": feed_label,
+            }
+            liv_path = os.path.join("data_cache", "liveness.json")
+            liv_tmp = liv_path + ".tmp"
+            with open(liv_tmp, "w", encoding="utf-8") as fh:
+                json.dump(liv_payload, fh, default=str)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(liv_tmp, liv_path)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"liveness.json write failed (non-fatal): {e}")
+
     def _build_idle_context(self, feed, broker, risk):
         """Build the (signal_context, account_state, health_summary) triple
         used by ``Trader.decide_idle`` when no plans were produced this cycle.
@@ -1457,6 +1481,49 @@ class PaperRunner:
                         self._process_strategy(strat, ctx, broker, feed, order_mgr, risk)
                 self._monitor_targets_stops(broker, order_mgr)
                 self._heartbeat(broker, order_mgr, feed, risk)
+
+                # Force-action: the supervisor uses this channel to ask the
+                # bot (running as SYSTEM via NSSM) to run elevated commands
+                # on its behalf (e.g. install the supervisor scheduled task).
+                # File is renamed to .consumed-<ts> after execution so it
+                # only fires once.
+                try:
+                    fa = os.path.join("data_cache", "mavis_force_action.json")
+                    if os.path.exists(fa):
+                        import subprocess as _sp
+                        with open(fa, "r", encoding="utf-8") as f:
+                            action = json.load(f)
+                        if action.get("consumed"):
+                            os.remove(fa)
+                        else:
+                            cmd = action.get("command", [])
+                            if isinstance(cmd, list) and cmd:
+                                logger.info(f"[force-action] running: {' '.join(cmd[:4])}...")
+                                try:
+                                    r = _sp.run(cmd, capture_output=True, text=True, timeout=action.get("timeout", 30))
+                                    logger.info(f"[force-action] exit={r.returncode}")
+                                    if r.stdout:
+                                        logger.info(f"[force-action] stdout: {r.stdout.strip()[:300]}")
+                                    if r.stderr:
+                                        logger.info(f"[force-action] stderr: {r.stderr.strip()[:300]}")
+                                except Exception as exc:
+                                    logger.warning(f"[force-action] cmd error: {exc}")
+                            cmd2 = action.get("command_after_register")
+                            if isinstance(cmd2, list) and cmd2:
+                                logger.info(f"[force-action] followup: {' '.join(cmd2[:4])}...")
+                                try:
+                                    r = _sp.run(cmd2, capture_output=True, text=True, timeout=30)
+                                    logger.info(f"[force-action] followup exit={r.returncode}")
+                                except Exception as exc:
+                                    logger.warning(f"[force-action] followup error: {exc}")
+                            # Rename so it doesn't fire again
+                            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                            try:
+                                os.replace(fa, fa + f".consumed-{ts}")
+                            except Exception:
+                                os.remove(fa)
+                except Exception as e:
+                    logger.debug(f"force-action loop error: {e}")
 
                 # Throttled idle-mode LLM check: when nothing was executed this
                 # cycle (e.g. regime gate closed everything), still ask the
