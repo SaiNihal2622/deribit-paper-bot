@@ -265,6 +265,7 @@ class PaperRunner:
         self.signal_log = signal_log or _SignalLog()
         self.trader = trader        # NEW: None = rule-based path only
         self._stop = threading.Event()
+        self._signaled_exit: bool = False  # set True by SIGINT/SIGTERM handler
         self._last_heartbeat = 0.0
         self._cycle_count = 0
         self._last_plan_at: dict[str, float] = {}  # strategy_name -> ts of last fire
@@ -760,7 +761,16 @@ class PaperRunner:
                 side = leg.get("side", "?")
                 exp = plan.expiry
                 if strike and exp:
-                    new_symbols.add(f"{ctx.underlying}-{exp.replace('-','')}-{strike}-{opt}")
+                    # Convert ISO date "2026-09-23" to canonical broker symbol
+                    # format "23SEP26" matching Deribit's symbol convention.
+                    try:
+                        exp_date = date.fromisoformat(exp)
+                        exp_canonical = exp_date.strftime("%d%b%y").upper()
+                    except (ValueError, TypeError):
+                        exp_canonical = exp.replace("-", "")
+                    new_symbols.add(
+                        f"{ctx.underlying}-{exp_canonical}-{strike}-{opt}"
+                    )
             dup = new_symbols & cur_symbols
             if dup:
                 logger.info(
@@ -1236,6 +1246,7 @@ class PaperRunner:
         def _shutdown(signum, frame):
             logger.info(f"received signal {signum}, shutting down...")
             self._stop.set()
+            self._signaled_exit = True  # exit non-zero so NSSM auto-restarts us
 
         try:
             signal.signal(signal.SIGINT, _shutdown)
@@ -1337,7 +1348,9 @@ class PaperRunner:
             feed.stop()
             broker.disconnect()
             self._save_state_summary(broker, order_mgr)
-        return 0
+        # Exit non-zero if we were signaled (so NSSM treats it as a crash and
+        # auto-restarts). Exit 0 only on clean shutdown via keyboard.
+        return 1 if getattr(self, "_signaled_exit", False) else 0
 
     @staticmethod
     def _save_state_summary(broker, order_mgr) -> None:
