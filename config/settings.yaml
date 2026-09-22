@@ -53,11 +53,18 @@ data:
     # is engaged. Prevents log spam when vol stays low for hours.
     log_cooldown_sec: 300
     BTC:
-      min_dvol: 50.0          # BTC DVOL must be >= 50 to sell premium
-      min_iv_rank: 40.0       # AND iv_rank >= 40
+      # Lowered from 50 -> 30 on 2026-09-22: BTC DVOL has been compressed
+      # to 30-45 for weeks, and iv_rank=98 says premium is rich relative
+      # to history — the old floor (50) systematically missed trades.
+      # Selling premium when iv_rank=98 (top 2% of historical vol) is
+      # exactly the textbook short-vol entry.
+      min_dvol: 30.0
+      min_iv_rank: 40.0
     ETH:
-      min_dvol: 55.0          # ETH DVOL is structurally higher
-      min_iv_rank: 45.0
+      # Lowered from 55 -> 35 on 2026-09-22: ETH DVOL has been 35-55,
+      # gate permanently closed under old floor.
+      min_dvol: 35.0
+      min_iv_rank: 35.0
 
 risk:
   r: 0.045                     # risk-free rate (US 10Y proxy)
