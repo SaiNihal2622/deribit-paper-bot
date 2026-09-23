@@ -776,16 +776,30 @@ class PaperRunner:
         if atm:
             atm_iv = (option_ivs.get((atm, "C"), 0.0) + option_ivs.get((atm, "P"), 0.0)) / 2.0
 
-        # DVOL-based IV rank
+        # DVOL-based IV rank.
+        # FIX 2026-09-23: the old formula `ratio * 50` where
+        # ratio = dvol_pct / (atm_iv * 100) pegged iv_rank at 100 any
+        # time DVOL was more than ~2x ATM IV (very common when the
+        # options market is uncertain about realized vol, or when the
+        # testnet data is sparse). That pinned BTC at iv_rank=100 and
+        # blocked every BTC strangle through the high_iv_rank_threshold.
+        # New formula: iv_rank is a 0..100 mapping of DVOL alone,
+        # bounded so high-vol regimes saturate at 100 but don't pin.
         dvol_pct = 0.0
         try:
             dvol_pct = float(feed.get_dvol(underlying)) * 100.0
         except (AttributeError, Exception):
             dvol_pct = 0.0
-        if dvol_pct > 0 and atm_iv > 0:
-            ratio = dvol_pct / (atm_iv * 100.0)
-            iv_rank = float(min(100.0, max(0.0, ratio * 50.0)))
+        if dvol_pct > 0:
+            # Linear 30..100 mapping: DVOL=30 -> 30, DVOL=80 -> 100,
+            # DVOL>80 saturates at 100. Prevents pegging when DVOL is
+            # high relative to a thin ATM IV stream.
+            if dvol_pct < 30:
+                iv_rank = max(0.0, dvol_pct)
+            else:
+                iv_rank = min(100.0, 30.0 + (dvol_pct - 30.0) * (70.0 / 50.0))
         else:
+            # No DVOL data — fall back to ATM IV buckets (legacy behaviour).
             if atm_iv <= 0.0:
                 iv_rank = 50.0
             elif atm_iv < 0.20:
@@ -1256,11 +1270,20 @@ class PaperRunner:
             # Expiry auto-close: if the trade's expiry has passed, close
             # it with reason="expired". Without this, expired Sep 18 trades
             # stay "open" in journal forever, inflating the position cap.
+            # FIX 2026-09-23: also fire on the SAME day once past 17:30 IST
+            # (Deribit weekly expiry is 12:00 UTC = 17:30 IST). The old
+            # `exp_date < today` check missed same-day expiries until
+            # midnight, leaving positions stale through the Asia session.
             expiry_iso = getattr(plan, "expiry", None) or ""
             if expiry_iso:
                 try:
                     exp_date = date.fromisoformat(expiry_iso)
-                    if exp_date < today:
+                    now_ist_hour = (datetime.now(timezone.utc).hour + 5) % 24
+                    past_expiry = (
+                        exp_date < today
+                        or (exp_date == today and now_ist_hour >= 17)
+                    )
+                    if past_expiry:
                         logger.info(
                             f"[monitor] trade {trade.trade_id} expired on "
                             f"{expiry_iso}, auto-closing"
