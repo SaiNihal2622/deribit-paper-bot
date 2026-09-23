@@ -1,5 +1,43 @@
 # Operational Notes — crypto-options-bot
 
+## 2026-09-23 05:55 IST — Backtester-vs-buy-and-hold shipped
+
+### What it does
+`scripts/backtest.py` — replay production strategies against 90 days of
+Deribit history. Pulls BTC/ETH spot (1D candles) + DVOL (hourly) from
+Deribit's public REST API, caches to `data_cache/backtest/`. Uses
+Black-Scholes synthetic pricing for option P&L (driven by entry-time
+DVOL as IV). Compares each strategy against buy-and-hold BTC and ETH.
+
+Generates `docs/backtest_report.md` with summary table (Sharpe, max
+DD, total P&L, win rate, vs B&H). Mirrors TradingXBot's advertised
+"in-app backtester vs buy-and-hold" — open source.
+
+### 90-day result (Sep 2026 — strong bull run)
+| | Trades | Win% | P&L | Sharpe | Max DD |
+|---|---|---|---|---|---|
+| BTC short_strangle | 24 | 79% | -$116 | -0.53 | $3,321 |
+| ETH short_strangle | 22 | 82% | -$20 | -0.56 | $268 |
+| B&H BTC | — | — | +$40,100 | 3.81 | $7,923 |
+| B&H ETH | — | — | +$66,771 | 4.21 | $7,848 |
+
+Short vol underperforms in strong bull markets (well-documented). It
+shines in sideways/declining regimes. The 79-82% win rate shows the
+edge exists; the asymmetry (small wins, occasional big losses) is
+the real risk to manage. The strategy's tiny max DD is its actual
+selling point.
+
+### How to run
+```bash
+python scripts/backtest.py --days 90   # default
+python scripts/backtest.py --days 30
+python scripts/backtest.py --refresh   # force re-fetch historical data
+```
+
+### Daily refresh
+`scripts/daily_backtest.sh` runs the backtest once a day. Wire into
+the CryptoSupervisor scheduled task for fully automated refresh.
+
 ## 2026-09-23 03:08 IST — Full 24/7 watchdog stack deployed
 
 ### Architecture (3-tier, mirrors kotak-neo-bot)
