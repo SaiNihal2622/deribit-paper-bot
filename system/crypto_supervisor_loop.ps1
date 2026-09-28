@@ -28,6 +28,8 @@ $SERVICE_BOT       = 'CryptoOptionsBot'
 $CHECK_INTERVAL_SEC  = 30
 $STALE_THRESHOLD_SEC = 180          # liveness older than this = bot is wedged
 $ORPHAN_KILL_EVERY   = 30           # every 30 cycles (~15 min) sweep for zombies
+$DAILY_BACKTEST_AT   = '09:00'      # IST; refresh backtest report each morning
+$DAILY_BACKTEST_FILE = (Join-Path $LOG_DIR 'daily_backtest.lastrun')
 
 if (-not (Test-Path $LOG_DIR)) {
     New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null
@@ -175,6 +177,31 @@ function Run-Cycle($cycle) {
     if (($cycle % 20) -eq 0) {
         $pid_str = if ($bot_pid) { $bot_pid.ToString() } else { 'none' }
         Log "[supervisor] cycle=$cycle OK | nssm=$svc | pid=$pid_str | liveness_age=[int]$age s"
+    }
+
+    # 6. Daily backtest refresh — runs once per day at $DAILY_BACKTEST_AT (IST).
+    #    Files under logs/ are persisted so we can dedupe by date. Cheap to call
+    #    every cycle: it just stat()'s a file.
+    try {
+        $now_ist = (Get-Date).ToUniversalTime().AddHours(5.5)  # IST = UTC+5:30
+        $today_key = $now_ist.ToString('yyyy-MM-dd')
+        $should_run = $false
+        if (Test-Path $DAILY_BACKTEST_FILE) {
+            $last_run = (Get-Content $DAILY_BACKTEST_FILE -Raw).Trim()
+            if ($last_run -ne $today_key) { $should_run = $true }
+        } else {
+            $should_run = $true   # first run ever
+        }
+        $hhmm = $now_ist.ToString('HH:mm')
+        if ($should_run -and $hhmm -eq $DAILY_BACKTEST_AT) {
+            Log "[supervisor] daily backtest trigger (ist=$hhmm)"
+            $bt = Join-Path $ROOT 'scripts\daily_backtest.sh'
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $bt 2>&1 | Out-Null
+            $today_key | Out-File $DAILY_BACKTEST_FILE -Encoding utf8
+            Log "[supervisor] daily backtest done"
+        }
+    } catch {
+        Log "[supervisor] daily backtest check error: $_"
     }
 }
 
