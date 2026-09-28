@@ -1719,13 +1719,66 @@ def cmd_paper(args) -> int:
 
 
 def cmd_live(args) -> int:
-    """Live trading — same as paper but with DeribitClient + safety guard."""
+    """Live trading — same as paper but with DeribitClient + safety guard.
+
+    Two-switch live-safety (mirrors TradingXBot's "two-switch" model):
+      1. DERIBIT_LIVE_CONFIRMED=YES  — explicit acknowledgment
+      2. LIVE_TRADING_ARMED_AT=<ISO8601 within last 24h>
+         — must be set within the last 24 hours; a stale value
+           (e.g. from a previous session's .env) does NOT enable
+           live trading. Both must be present AND the timestamp
+           must be fresh, or the bot refuses to start.
+    """
     if os.environ.get("DERIBIT_LIVE_CONFIRMED", "").strip().upper() != "YES":
         logger.error(
             "Live mode refused: DERIBIT_LIVE_CONFIRMED=YES is required in the env. "
-            "This is the safety guard against accidental live orders."
+            "This is the safety guard against accidental live orders. "
+            "(Switch 1 of 2: explicit acknowledgment.)"
         )
         return 1
+    # Switch 2: a fresh arm timestamp. Prevents a stale .env from
+    # accidentally enabling live trading on a bot restart that the
+    # user forgot about. Must be within the last 24h.
+    armed_at_raw = os.environ.get("LIVE_TRADING_ARMED_AT", "").strip()
+    if not armed_at_raw:
+        logger.error(
+            "Live mode refused: LIVE_TRADING_ARMED_AT is not set. "
+            "Set it to current UTC ISO-8601 timestamp, e.g.\n"
+            "  export LIVE_TRADING_ARMED_AT=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"\n"
+            "Switch 2 of 2: time-bounded arm."
+        )
+        return 1
+    try:
+        from datetime import datetime, timezone, timedelta
+        # Tolerate trailing Z or +00:00
+        armed_at = datetime.fromisoformat(armed_at_raw.replace("Z", "+00:00"))
+        if armed_at.tzinfo is None:
+            armed_at = armed_at.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - armed_at
+    except Exception as e:
+        logger.error(
+            f"Live mode refused: LIVE_TRADING_ARMED_AT={armed_at_raw!r} "
+            f"is not a valid ISO-8601 timestamp: {e}"
+        )
+        return 1
+    if age > timedelta(hours=24):
+        logger.error(
+            f"Live mode refused: LIVE_TRADING_ARMED_AT={armed_at_raw} "
+            f"is {age.total_seconds() / 3600:.1f}h old (max 24h). "
+            "Re-arm by exporting a fresh timestamp."
+        )
+        return 1
+    if age < timedelta(minutes=-1):
+        logger.error(
+            f"Live mode refused: LIVE_TRADING_ARMED_AT={armed_at_raw} is in the future. "
+            "Clock skew? Re-set with current UTC time."
+        )
+        return 1
+    logger.success(
+        f"Live-safety: 2/2 switches ON. "
+        f"DERIBIT_LIVE_CONFIRMED=YES, LIVE_TRADING_ARMED_AT={armed_at.isoformat()} "
+        f"(age {age.total_seconds() / 60:.0f}m)."
+    )
     if not os.environ.get("DERIBIT_CLIENT_ID") or not os.environ.get("DERIBIT_CLIENT_SECRET"):
         logger.error(
             "Live mode refused: DERIBIT_CLIENT_ID and DERIBIT_CLIENT_SECRET are required."

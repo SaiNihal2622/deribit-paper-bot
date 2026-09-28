@@ -58,8 +58,11 @@ data:
       # to history — the old floor (50) systematically missed trades.
       # Selling premium when iv_rank=98 (top 2% of historical vol) is
       # exactly the textbook short-vol entry.
+      # Lowered further 40 -> 35 on 2026-09-29: BTC has been stuck at
+      # iv_rank 38-39 for 24h+, blocking all BTC trades. 35 lets through
+      # the marginal-regime entries that the older 50 floor missed entirely.
       min_dvol: 30.0
-      min_iv_rank: 40.0
+      min_iv_rank: 35.0
     ETH:
       # Lowered from 55 -> 35 on 2026-09-22: ETH DVOL has been 35-55,
       # gate permanently closed under old floor.
