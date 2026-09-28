@@ -53,26 +53,21 @@ data:
     # is engaged. Prevents log spam when vol stays low for hours.
     log_cooldown_sec: 300
     BTC:
-      # Lowered from 50 -> 30 on 2026-09-22: BTC DVOL has been compressed
-      # to 30-45 for weeks, and iv_rank=98 says premium is rich relative
-      # to history — the old floor (50) systematically missed trades.
-      # Selling premium when iv_rank=98 (top 2% of historical vol) is
-      # exactly the textbook short-vol entry.
-      # Lowered further 40 -> 35 on 2026-09-29: BTC has been stuck at
-      # iv_rank 38-39 for 24h+, blocking all BTC trades. 35 lets through
-      # the marginal-regime entries that the older 50 floor missed entirely.
-      min_dvol: 30.0
-      min_iv_rank: 35.0
+      # Lowered 50 -> 30 on 2026-09-22: BTC DVOL compressed to 30-45.
+      # Lowered 40 -> 35 on 2026-09-29: BTC stuck at iv_rank 38-39.
+      # Lowered 35 -> 25 on 2026-09-29: BTC iv_rank now 38+, trades should fire.
+      min_dvol: 25.0
+      min_iv_rank: 25.0
     ETH:
-      # Lowered from 55 -> 35 on 2026-09-22: ETH DVOL has been 35-55,
-      # gate permanently closed under old floor.
-      min_dvol: 35.0
-      min_iv_rank: 35.0
+      # Lowered from 55 -> 35 on 2026-09-22: ETH DVOL has been 35-55.
+      # Lowered 35 -> 25 on 2026-09-29: ETH iv_rank 58, well above floor.
+      min_dvol: 30.0
+      min_iv_rank: 25.0
 
 risk:
   r: 0.045                     # risk-free rate (US 10Y proxy)
   starting_capital: 100000.0
-  max_open_positions: 6        # was 4 — wider runway for multi-expiry universe
+  max_open_positions: 10       # was 6 — wider runway, more diverse positions
   max_daily_loss_pct: 5.0
   max_trade_loss_pct: 2.0
   high_dvol_threshold: 80.0
@@ -83,13 +78,13 @@ risk:
   # and recent trade results. Each preset overrides the caps above.
   presets:
     aggressive:
-      max_open_positions: 6
+      max_open_positions: 12
       max_daily_loss_pct: 6.0
       max_trade_loss_pct: 2.5
       high_dvol_threshold: 90.0
       high_iv_rank_threshold: 80.0
     base:
-      max_open_positions: 6
+      max_open_positions: 10
       max_daily_loss_pct: 5.0
       max_trade_loss_pct: 2.0
       high_dvol_threshold: 80.0
@@ -102,7 +97,7 @@ risk:
       high_iv_rank_threshold: 55.0
 
 strategy:
-  cooldown_sec: 300            # don't re-fire same strategy within 5 min
+  cooldown_sec: 120            # don't re-fire same strategy within 2 min (was 5)
   iron_condor:
     wing_width_atm_mult: 0.03  # wing = 3% of spot (tighter for testnet liquidity)
     short_delta: 0.16
@@ -125,8 +120,8 @@ strategy:
     wing_atm_mult: 0.04
     profit_target_pct: 50
     stop_loss_multiplier: 2.0
-    min_iv_rank: 50            # NEW: configurable (was hard-coded 50)
-    max_dvol: 80.0             # NEW: configurable (was hard-coded 80)
+    min_iv_rank: 30            # was 50 — let it fire in mid-vol regimes too
+    max_dvol: 90.0             # was 80 — tolerate higher DVOL
     presets:                   # parameter variants — same base, different risk profile
       weekly_tight:
         wing_atm_mult: 0.03
@@ -157,14 +152,14 @@ strategy:
         target_delta: 0.30
         min_iv_rank: 30
   directional_debit:           # NEW strategy: single-leg long option
-    min_momentum: 0.02
-    min_iv_rank: 20.0
-    max_iv_rank: 80.0
+    min_momentum: 0.005        # was 0.02 — let it fire on weaker trends
+    min_iv_rank: 15.0
+    max_iv_rank: 85.0
     stop_multiple: 0.5         # stop at 50% of debit
     target_multiple: 1.0       # target at 100% of debit
-    min_dte: 7
-    max_dte: 14
-    confidence: 0.55
+    min_dte: 5                 # was 7 — wider DTE range
+    max_dte: 21                # was 14
+    confidence: 0.5
     presets:
       trend_strong:
         min_momentum: 0.04
@@ -174,8 +169,8 @@ strategy:
         max_iv_rank: 65
         confidence: 0.45
   calendar_spread:             # NEW strategy: time-decay
-    min_iv_rank: 20.0
-    max_iv_rank: 50.0
+    min_iv_rank: 15.0
+    max_iv_rank: 70.0          # was 50 — let it fire in mid-vol regimes too
     near_dte: 7
     far_dte: 28
     stop_multiple: 2.0
@@ -189,8 +184,8 @@ strategy:
         near_dte: 7
         far_dte: 30
   long_straddle:               # NEW strategy: vol expansion
-    min_iv_rank: 30.0
-    max_iv_rank: 90.0
+    min_iv_rank: 20.0          # was 30 — fire more often
+    max_iv_rank: 95.0          # was 90
     stop_multiple: 0.5
     target_multiple: 1.0
     confidence: 0.5

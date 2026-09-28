@@ -310,10 +310,20 @@ class PaperRunner:
         self._settings_yaml_mtime: float = 0.0
 
     def _maybe_reload_config(self) -> None:
-        """Reload regime gate thresholds from settings.yaml when the file changes.
+        """Reload regime gate thresholds + risk caps from settings.yaml when
+        the file changes.
 
         Cheap to call every cycle (just a stat + dict compare). Lets the user
-        tune DVOL / iv_rank / cooldown floors without restarting the bot.
+        tune DVOL / iv_rank / cooldown / max_open_positions floors without
+        restarting the bot.
+
+        Coverage:
+          - cooldown_sec
+          - regime_gate (enabled, log_cooldown_sec, per-currency thresholds)
+          - risk caps (max_open_positions, max_daily_loss_pct, max_trade_loss_pct)
+          - risk thresholds (high_dvol_threshold, high_iv_rank_threshold)
+        Strategy-specific min_iv_rank and strategy presets still require a
+        restart because they're baked into strategy instances at __init__.
         """
         try:
             p = Path(self._settings_yaml_path)
@@ -338,6 +348,22 @@ class PaperRunner:
                     float(cur_cfg.get("min_dvol", self._regime_gate_thresholds.get(cur, (50.0, 40.0))[0])),
                     float(cur_cfg.get("min_iv_rank", self._regime_gate_thresholds.get(cur, (50.0, 40.0))[1])),
                 )
+            # Risk caps: update the active risk preset's fields in-place so
+            # the running engine picks them up next cycle. The risk object
+            # reads these attributes directly.
+            risk_cfg = cfg.get("risk", {}) or {}
+            risk_ref = getattr(self, "_risk_ref", None)
+            if risk_ref is not None:
+                if "max_open_positions" in risk_cfg:
+                    risk_ref.max_open_positions = int(risk_cfg["max_open_positions"])
+                if "max_daily_loss_pct" in risk_cfg:
+                    risk_ref.max_daily_loss_pct = float(risk_cfg["max_daily_loss_pct"])
+                if "max_trade_loss_pct" in risk_cfg:
+                    risk_ref.max_trade_loss_pct = float(risk_cfg["max_trade_loss_pct"])
+                if "high_dvol_threshold" in risk_cfg:
+                    risk_ref.high_dvol_threshold = float(risk_cfg["high_dvol_threshold"])
+                if "high_iv_rank_threshold" in risk_cfg:
+                    risk_ref.high_iv_rank_threshold = float(risk_cfg["high_iv_rank_threshold"])
             logger.info(
                 "config reloaded: cooldown=%.0fs  regime_gate=%s  thresholds=%s",
                 self._cooldown_sec,
