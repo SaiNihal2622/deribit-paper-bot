@@ -110,6 +110,16 @@ strategy:
     stop_loss_multiplier: 2.0
     min_iv_rank: 30            # NEW: configurable (was hard-coded 40)
     max_dvol: 90.0             # NEW: configurable (was hard-coded 90)
+    presets:                   # parameter variants (TradingXBot-style 25 strategies)
+      conservative:
+        wing_width_atm_mult: 0.025
+        short_delta: 0.12
+      neutral:
+        wing_width_atm_mult: 0.03
+        short_delta: 0.16
+      aggressive:
+        wing_width_atm_mult: 0.035
+        short_delta: 0.20
   short_strangle:
     short_delta: 0.20
     wing_atm_mult: 0.04
@@ -117,6 +127,19 @@ strategy:
     stop_loss_multiplier: 2.0
     min_iv_rank: 50            # NEW: configurable (was hard-coded 50)
     max_dvol: 80.0             # NEW: configurable (was hard-coded 80)
+    presets:                   # parameter variants — same base, different risk profile
+      weekly_tight:
+        wing_atm_mult: 0.03
+        min_iv_rank: 50
+      weekly_wide:
+        wing_atm_mult: 0.06
+        min_iv_rank: 50
+      monthly_tight:
+        wing_atm_mult: 0.04
+        min_iv_rank: 35         # wider DTE = more theta, lower iv_rank ok
+      monthly_wide:
+        wing_atm_mult: 0.07
+        min_iv_rank: 35
   # NEW: single-leg short call for testnet where put liquidity is broken.
   # Uses only the call side; works on real bid/ask quotes.
   short_call:
@@ -126,6 +149,13 @@ strategy:
     min_iv_rank: 35            # lower threshold — fire in mid-vol regimes too
     max_dvol: 90.0             # tolerate higher DVOL for short premium
     wing_atm_mult: 0.05
+    presets:
+      conservative:
+        target_delta: 0.16
+        min_iv_rank: 40
+      aggressive:
+        target_delta: 0.30
+        min_iv_rank: 30
   directional_debit:           # NEW strategy: single-leg long option
     min_momentum: 0.02
     min_iv_rank: 20.0
@@ -135,6 +165,14 @@ strategy:
     min_dte: 7
     max_dte: 14
     confidence: 0.55
+    presets:
+      trend_strong:
+        min_momentum: 0.04
+        min_dte: 5
+      mean_reversion:
+        min_momentum: 0.005
+        max_iv_rank: 65
+        confidence: 0.45
   calendar_spread:             # NEW strategy: time-decay
     min_iv_rank: 20.0
     max_iv_rank: 50.0
@@ -143,12 +181,26 @@ strategy:
     stop_multiple: 2.0
     target_multiple: 0.5
     confidence: 0.5
+    presets:
+      weekly_back:              # 7->14 day calendar (faster decay)
+        near_dte: 7
+        far_dte: 14
+      monthly_back:             # 7->30 day calendar (more time-value)
+        near_dte: 7
+        far_dte: 30
   long_straddle:               # NEW strategy: vol expansion
     min_iv_rank: 30.0
     max_iv_rank: 90.0
     stop_multiple: 0.5
     target_multiple: 1.0
     confidence: 0.5
+    presets:
+      front_week:              # 7 DTE straddle (cheaper, faster theta)
+        min_dte: 5
+        max_dte: 10
+      back_month:              # 30 DTE straddle (more vega exposure)
+        min_dte: 25
+        max_dte: 35
 
 alerts:
   telegram:

@@ -30,13 +30,13 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from .base import StrategyName, TradePlan
+from .base import BaseStrategy, StrategyName, TradePlan
 from ._helpers import dte_from_ddmmyy
 
 logger = logging.getLogger(__name__)
 
 
-class ShortCallStrategy:
+class ShortCallStrategy(BaseStrategy):
     name = StrategyName.SHORT_CALL
     """Display name: 'short_call'."""
 

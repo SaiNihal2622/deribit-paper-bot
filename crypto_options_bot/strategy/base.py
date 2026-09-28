@@ -85,6 +85,25 @@ class BaseStrategy(ABC):
 
     name: StrategyName
 
+    # Subclasses can accept an optional preset_name in __init__ so that
+    # one strategy class can be instantiated multiple times with different
+    # parameter sets (e.g. short_strangle:weekly_tight vs :weekly_wide).
+    # The `unique_name` property is used as the cooldown key, so each
+    # preset gets its own throttle slot.
+    preset_name: str = ""
+
+    def __init__(self, config: dict | None = None):
+        self.config = config or {}
+        # Allow callers to inject a preset_name via constructor keyword or
+        # via a config dict with key `_preset_name` (less common).
+
+    @property
+    def unique_name(self) -> str:
+        """Stable identifier for cooldown + signal-log filtering."""
+        if self.preset_name:
+            return f"{self.name.value}:{self.preset_name}"
+        return self.name.value
+
     @abstractmethod
     def is_eligible(self, ctx: SignalContext, account_state: dict) -> tuple[bool, str]: ...
 

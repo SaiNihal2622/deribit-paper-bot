@@ -722,21 +722,53 @@ class PaperRunner:
         )
 
     def _build_strategies(self) -> list:
-        """Construct strategy instances from config."""
+        """Construct strategy instances from config.
+
+        Each strategy config can have either:
+          - a flat dict of params (one instance), OR
+          - a `presets` sub-dict (one instance per preset key, sharing the
+            flat dict's params as defaults).
+
+        Presets are the TradingXBot-style "25 strategies" feature —
+        parameter variants of the same base strategy, each with their
+        own cooldown slot, signal log entries, and trades journal
+        attribution via `unique_name = "<strategy>:<preset>"`.
+        """
         strat_cfg = self.cfg.get("strategy", {})
         strategies = []
-        if "iron_condor" in strat_cfg:
-            strategies.append(IronCondorStrategy(strat_cfg.get("iron_condor", {})))
-        if "short_strangle" in strat_cfg:
-            strategies.append(ShortStrangleStrategy(strat_cfg.get("short_strangle", {})))
-        if "short_call" in strat_cfg:
-            strategies.append(ShortCallStrategy(strat_cfg.get("short_call", {})))
-        if "directional_debit" in strat_cfg:
-            strategies.append(DirectionalDebitStrategy(strat_cfg.get("directional_debit", {})))
-        if "calendar_spread" in strat_cfg:
-            strategies.append(CalendarSpreadStrategy(strat_cfg.get("calendar_spread", {})))
-        if "long_straddle" in strat_cfg:
-            strategies.append(LongStraddleStrategy(strat_cfg.get("long_straddle", {})))
+
+        # Map of strategy_name -> (class, base_default_config)
+        # Order matters: more conservative strategies first.
+        registry = [
+            ("iron_condor", IronCondorStrategy),
+            ("short_strangle", ShortStrangleStrategy),
+            ("short_call", ShortCallStrategy),
+            ("directional_debit", DirectionalDebitStrategy),
+            ("calendar_spread", CalendarSpreadStrategy),
+            ("long_straddle", LongStraddleStrategy),
+        ]
+
+        for strat_name, strat_cls in registry:
+            cfg = strat_cfg.get(strat_name)
+            if not cfg:
+                continue
+            # Flat config (no presets) -> one default instance.
+            if "presets" not in cfg:
+                inst = strat_cls(cfg)
+                strategies.append(inst)
+                continue
+            # Presets block: instantiate one per preset key, inheriting
+            # the flat-dict params as defaults (preset values override).
+            base_default = {k: v for k, v in cfg.items() if k != "presets"}
+            for preset_key, preset_overrides in (cfg.get("presets") or {}).items():
+                merged = {**base_default, **(preset_overrides or {})}
+                inst = strat_cls(merged)
+                inst.preset_name = str(preset_key)
+                strategies.append(inst)
+                logger.info(
+                    f"strategy preset: {strat_name}:{preset_key} "
+                    f"(merged params: {sorted(merged.keys())})"
+                )
         return strategies
 
     def _build_signal_context(self, underlying, feed, broker) -> Optional[SignalContext]:
@@ -865,7 +897,7 @@ class PaperRunner:
         4. Trader LLM (discretionary veto / downsize — only if self.trader is set)
         5. Execute
         """
-        name = strategy.name.value
+        name = strategy.unique_name
         last = self._last_plan_at.get(name, 0.0)
         if time.time() - last < self._cooldown_sec:
             return
@@ -919,6 +951,12 @@ class PaperRunner:
                         f"Waiting for vol to recover (no trades)."
                     )
                     self._regime_gate_last_log[last_log_key] = now
+                    # Telegram hook: regime gate engaged
+                    if self.alerter is not None:
+                        self.alerter.notify_regime_gate(
+                            underlying=cur, dvol=dvol, iv_rank=ivr,
+                            blocked=True, reason=reason,
+                        )
                 self.signal_log.append(
                     strategy=name, underlying=cur,
                     status="rejected", reason=f"regime_gate: {reason}",
@@ -1288,6 +1326,16 @@ class PaperRunner:
                             f"[monitor] trade {trade.trade_id} expired on "
                             f"{expiry_iso}, auto-closing"
                         )
+                        # Telegram hook: expiry auto-close
+                        if self.alerter is not None:
+                            strat = plan.strategy.value if plan else "?"
+                            underlying = plan.underlying if plan else "?"
+                            self.alerter.notify_expiry_auto_close(
+                                trade_id=trade.trade_id,
+                                underlying=underlying,
+                                strategy=strat,
+                                expiry=expiry_iso,
+                            )
                         try:
                             order_mgr.close_trade(
                                 trade.trade_id, reason="expired"

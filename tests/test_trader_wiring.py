@@ -16,6 +16,7 @@ from unittest import mock
 
 from crypto_options_bot.agent.memory import Memory
 from crypto_options_bot.agent.trader import TradeAction, Trader, TraderDecision
+from crypto_options_bot.strategy.base import BaseStrategy
 
 
 class _StubRiskDecision:
@@ -38,11 +39,11 @@ class _StubPlan:
         self.expiry = "2026-09-18"
 
 
-class _StubStrategy:
+class _StubStrategy(BaseStrategy):
     class _N:
         value = "short_strangle"
     name = _N()
-    def is_eligible(self, ctx):
+    def is_eligible(self, ctx, account_state=None):
         return True
     def build_plan(self, ctx, account_state=None):
         return _StubPlan()
