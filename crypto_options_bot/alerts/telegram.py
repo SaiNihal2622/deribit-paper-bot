@@ -137,6 +137,50 @@ class TelegramAlerter:
         msg = f"{reason.upper()}: {strategy} {underlying} (trade {getattr(trade, 'trade_id', '?')})"
         self.send(msg)
 
+    def notify_regime_gate(self, underlying: str, dvol: float, iv_rank: float, blocked: bool, reason: str = "") -> None:
+        """Notify when the IV-regime circuit breaker engages/disengages.
+
+        Args:
+            underlying: "BTC" or "ETH"
+            dvol: current DVOL (annualized %)
+            iv_rank: current 0-100 iv_rank
+            blocked: True if gate is engaged (no trades), False if released
+            reason: short reason string from the gate logic
+        """
+        if not self.enabled:
+            return
+        try:
+            state = "BLOCKED" if blocked else "OPEN"
+            tail = f" ({reason})" if reason else ""
+            msg = f"REGIME GATE {state}: {underlying} dvol={dvol:.1f} iv_rank={iv_rank:.1f}{tail}"
+            self.send(msg)
+        except Exception as e:
+            logger.debug(f"notify_regime_gate error: {e}")
+
+    def notify_expiry_auto_close(self, trade_id: str, underlying: str, strategy: str, expiry: str) -> None:
+        """Notify when a trade is auto-closed because its expiry has passed."""
+        if not self.enabled:
+            return
+        try:
+            msg = f"EXPIRY CLOSE: {strategy} {underlying} trade={trade_id} expiry={expiry}"
+            self.send(msg)
+        except Exception as e:
+            logger.debug(f"notify_expiry_auto_close error: {e}")
+
+    def notify_daily_summary(self, cycle: int, n_trades: int, realized: float, unrealized: float) -> None:
+        """Optional end-of-day summary (called by supervisor at end of cycle)."""
+        if not self.enabled:
+            return
+        try:
+            sign_r = "+" if realized >= 0 else ""
+            msg = (
+                f"DAILY: cycle={cycle} trades={n_trades} "
+                f"realized={sign_r}{realized:.4f} unrealized={unrealized:.4f}"
+            )
+            self.send(msg)
+        except Exception as e:
+            logger.debug(f"notify_daily_summary error: {e}")
+
     # ------------------------------------------------------------------
     def _worker(self) -> None:
         """Drain the queue, sending each message via Telegram Bot API."""
