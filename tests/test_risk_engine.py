@@ -106,3 +106,105 @@ def test_status_includes_preset_and_counters():
     assert s["open_positions"] == 1
     assert "consecutive_losses" in s
     assert "consecutive_wins" in s
+
+
+# ---------- Quantity scaling tests (the "actually profitable" change) ----------
+
+
+def test_qty_scales_with_risk_budget():
+    """qty = floor(risk_budget / risk_per_contract).
+
+    With $100k capital, 2% per-trade risk = $2000 budget. Plan stop=$0.40 →
+    floor(2000/0.40) = 5000 contracts. Capped at max_contracts_per_trade.
+    """
+    eng = RiskEngine({
+        "starting_capital": 100_000.0,
+        "max_trade_loss_pct": 2.0,
+        "max_open_positions": 10,
+        "max_contracts_per_trade": 200,
+    })
+    d = eng.check_trade(_plan(stop=0.40, target=0.04),
+                        account_state={"open_positions": 0, "realized_pnl": 0.0,
+                                       "capital": 100_000.0})
+    assert d.allowed
+    # floor(2000 / 0.40) = 5000 → capped at 200
+    assert d.suggested_qty == 200
+
+
+def test_qty_respects_max_contracts_cap():
+    """Even when risk_budget/qty is large, we cap at max_contracts_per_trade."""
+    eng = RiskEngine({
+        "starting_capital": 100_000.0,
+        "max_trade_loss_pct": 5.0,  # big budget
+        "max_open_positions": 10,
+        "max_contracts_per_trade": 50,
+    })
+    d = eng.check_trade(_plan(stop=0.10, target=0.02),
+                        account_state={"open_positions": 0, "realized_pnl": 0.0,
+                                       "capital": 100_000.0})
+    assert d.allowed
+    # floor(5000 / 0.10) = 50000 → capped at 50
+    assert d.suggested_qty == 50
+
+
+def test_qty_halves_in_high_dvol_regime():
+    """DVOL > high_dvol_threshold cuts qty in half."""
+    eng = RiskEngine({
+        "starting_capital": 100_000.0,
+        "max_trade_loss_pct": 2.0,
+        "max_open_positions": 10,
+        "max_contracts_per_trade": 200,
+        "high_dvol_threshold": 80.0,
+    })
+    d_low = eng.check_trade(_plan(stop=0.40, target=0.04),
+                            account_state={"open_positions": 0, "realized_pnl": 0.0,
+                                           "capital": 100_000.0})
+    assert d_low.allowed
+    assert d_low.suggested_qty == 200
+
+    eng.update_market_state(dvol=85.0, iv_rank=50.0)
+    d_high = eng.check_trade(_plan(stop=0.40, target=0.04),
+                             account_state={"open_positions": 0, "realized_pnl": 0.0,
+                                            "capital": 100_000.0})
+    assert d_high.allowed
+    # 200 // 2 = 100
+    assert d_high.allowed
+    assert d_high.suggested_qty == 100
+
+
+def test_qty_scales_1_5x_in_aggressive_preset():
+    """Aggressive preset multiplies base qty by 1.5 (still capped)."""
+    eng = RiskEngine({
+        "starting_capital": 100_000.0,
+        "max_trade_loss_pct": 2.0,
+        "max_open_positions": 10,
+        "max_contracts_per_trade": 200,
+        "wins_to_aggressive": 1,
+    })
+    eng.update_market_state(dvol=30.0, iv_rank=30.0)
+    # Force aggressive via 5 wins
+    for _ in range(5):
+        eng.record_trade_result(0.01)
+    assert eng.state.preset == "aggressive"
+    d = eng.check_trade(_plan(stop=0.20, target=0.04),
+                        account_state={"open_positions": 0, "realized_pnl": 0.5,
+                                       "capital": 100_000.0})
+    assert d.allowed
+    # floor(2000/0.20) = 10000 → capped 200 → 200 * 1.5 = 300 → capped 200
+    assert d.suggested_qty == 200
+
+
+def test_qty_floor_is_one_when_stop_is_tiny():
+    """If plan.stop is very small, base_qty floor is 1, not 0."""
+    eng = RiskEngine({
+        "starting_capital": 100_000.0,
+        "max_trade_loss_pct": 2.0,
+        "max_open_positions": 10,
+        "max_contracts_per_trade": 200,
+    })
+    # Plan with stop = 0.001 → 2000 / 0.001 = 2M contracts → capped 200
+    d = eng.check_trade(_plan(stop=0.001, target=0.0005),
+                        account_state={"open_positions": 0, "realized_pnl": 0.0,
+                                       "capital": 100_000.0})
+    assert d.allowed
+    assert d.suggested_qty == 200

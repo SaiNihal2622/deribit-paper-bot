@@ -72,6 +72,13 @@ risk:
   max_trade_loss_pct: 2.0
   high_dvol_threshold: 80.0
   high_iv_rank_threshold: 75.0
+  # Position sizing — the risk engine scales qty so each trade's max
+  # loss approximates max_trade_loss_pct of capital. Capped here so a
+  # single trade can't exceed this many contracts (exchange rate-limit
+  # safety). 200 contracts * $0.37 stop ≈ $74/trade, well within the
+  # 2% capital risk budget — we cap to prevent runaway sizing on tiny
+  # stop values.
+  max_contracts_per_trade: 200
   losses_to_defensive: 3       # N consecutive losses -> defensive preset
   wins_to_aggressive: 5        # N consecutive wins -> aggressive preset
   # NEW: adaptive risk presets. The engine picks one based on DVOL
@@ -83,12 +90,14 @@ risk:
       max_trade_loss_pct: 2.5
       high_dvol_threshold: 90.0
       high_iv_rank_threshold: 80.0
+      max_contracts_per_trade: 300
     base:
       max_open_positions: 10
       max_daily_loss_pct: 5.0
       max_trade_loss_pct: 2.0
       high_dvol_threshold: 80.0
       high_iv_rank_threshold: 75.0
+      max_contracts_per_trade: 200
     defensive:
       max_open_positions: 2
       max_daily_loss_pct: 2.5
@@ -101,8 +110,8 @@ strategy:
   iron_condor:
     wing_width_atm_mult: 0.03  # wing = 3% of spot (tighter for testnet liquidity)
     short_delta: 0.16
-    profit_target_pct: 50
-    stop_loss_multiplier: 2.0
+    profit_target_pct: 70      # was 50 — collect more premium before exit
+    stop_loss_multiplier: 1.0  # was 2.0 — tighter stop, better R:R (need >74% WR)
     min_iv_rank: 30            # NEW: configurable (was hard-coded 40)
     max_dvol: 90.0             # NEW: configurable (was hard-coded 90)
     presets:                   # parameter variants (TradingXBot-style 25 strategies)
@@ -118,8 +127,8 @@ strategy:
   short_strangle:
     short_delta: 0.20
     wing_atm_mult: 0.04
-    profit_target_pct: 50
-    stop_loss_multiplier: 2.0
+    profit_target_pct: 70      # was 50 — collect more premium before exit
+    stop_loss_multiplier: 1.0  # was 2.0 — tighter stop, better R:R
     min_iv_rank: 30            # was 50 — let it fire in mid-vol regimes too
     max_dvol: 90.0             # was 80 — tolerate higher DVOL
     presets:                   # parameter variants — same base, different risk profile
@@ -139,8 +148,8 @@ strategy:
   # Uses only the call side; works on real bid/ask quotes.
   short_call:
     target_delta: 0.20
-    profit_target_pct: 50
-    stop_loss_multiplier: 2.0
+    profit_target_pct: 70      # was 50
+    stop_loss_multiplier: 1.0  # was 2.0
     min_iv_rank: 35            # lower threshold — fire in mid-vol regimes too
     max_dvol: 90.0             # tolerate higher DVOL for short premium
     wing_atm_mult: 0.05

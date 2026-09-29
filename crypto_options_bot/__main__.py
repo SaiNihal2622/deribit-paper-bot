@@ -364,6 +364,8 @@ class PaperRunner:
                     risk_ref.high_dvol_threshold = float(risk_cfg["high_dvol_threshold"])
                 if "high_iv_rank_threshold" in risk_cfg:
                     risk_ref.high_iv_rank_threshold = float(risk_cfg["high_iv_rank_threshold"])
+                if "max_contracts_per_trade" in risk_cfg:
+                    risk_ref.max_contracts_per_trade = int(risk_cfg["max_contracts_per_trade"])
             logger.info(
                 "config reloaded: cooldown=%.0fs  regime_gate=%s  thresholds=%s",
                 self._cooldown_sec,

@@ -124,6 +124,9 @@ class RiskEngine:
         self.max_trade_loss_pct = float(cfg.get("max_trade_loss_pct", 2.0))
         self.high_dvol_threshold = float(cfg.get("high_dvol_threshold", 80.0))
         self.high_iv_rank_threshold = float(cfg.get("high_iv_rank_threshold", 75.0))
+        # Position sizing — max contracts per trade. Caps the qty scaling
+        # so a single trade can't blow through exchange limits. Default 200.
+        self.max_contracts_per_trade = int(cfg.get("max_contracts_per_trade", 200))
 
         starting_capital = float(cfg.get("starting_capital", 100_000.0))
         self.state = RiskState(capital=starting_capital)
@@ -282,12 +285,39 @@ class RiskEngine:
                 preset=self.state.preset,
             )
 
-        # 4) qty sizing — start at 1, then trim if DVOL / IV rank are extreme
-        base_qty = 1
+        # 4) qty sizing — scale by risk budget, NOT always 1 contract.
+        #
+        # The bot collects tiny premiums (~0.04 per BTC strangle). At 1
+        # contract per trade, even a 100% win-rate session nets pennies on
+        # $100k capital. The right approach is to size qty so the per-trade
+        # max loss approximates ``max_trade_loss_pct`` of capital. That way
+        # a 50% profit-target hit yields meaningful absolute P&L.
+        #
+        # Formula:
+        #   risk_per_contract = |plan.stop|              (e.g. 0.37)
+        #   risk_budget       = capital * (max_trade_loss_pct / 100)
+        #   qty               = floor(risk_budget / risk_per_contract)
+        #                       (floored at 1 if plan.stop is tiny)
+        #
+        # Capped by `max_contracts_per_trade` (default 200) so we don't
+        # accidentally blow through exchange rate limits or position limits
+        # on a single trade. High-dvol / high-iv-rank regimes trim qty.
+        risk_per_contract = abs(plan.stop) if plan.stop else 1.0
+        risk_budget = self._max_trade_loss_capital()
+        if risk_per_contract <= 0:
+            base_qty = 1
+        else:
+            base_qty = max(1, int(risk_budget / risk_per_contract))
+
+        # Cap absolute qty (single-trade notional safety)
+        max_contracts = int(getattr(self, "max_contracts_per_trade", 200))
+        base_qty = min(base_qty, max_contracts)
+
+        # DVOL / IV-rank regime trims (existing behaviour)
         if self.state.dvol > self.high_dvol_threshold:
-            base_qty = 0
+            base_qty = max(0, base_qty // 2)        # halve in extreme vol
         if self.state.iv_rank > self.high_iv_rank_threshold:
-            base_qty = max(0, base_qty - 1)
+            base_qty = max(0, base_qty // 2)
 
         if base_qty <= 0:
             return RiskDecision(
@@ -300,9 +330,15 @@ class RiskEngine:
                 preset=self.state.preset,
             )
 
+        # In aggressive preset, scale up further (more risk tolerance)
+        if self.state.preset == "aggressive":
+            base_qty = min(max_contracts, int(base_qty * 1.5))
+
         logger.debug(
             f"RiskEngine ALLOW {plan.strategy.value} {plan.underlying} "
-            f"qty={base_qty} max_loss={max_loss_for_trade:.2f} "
+            f"qty={base_qty} risk_per_contract={risk_per_contract:.4f} "
+            f"risk_budget={risk_budget:.2f} "
+            f"max_loss_total={risk_per_contract * base_qty:.2f} "
             f"open={self.state.open_positions}/{self.max_open_positions} preset={self.state.preset}"
         )
         return RiskDecision(
