@@ -790,6 +790,10 @@ class PaperRunner:
             cfg = strat_cfg.get(strat_name)
             if not cfg:
                 continue
+            # Allow per-strategy disable via `enabled: false` in config.
+            if not bool(cfg.get("enabled", True)):
+                logger.info(f"[strategy] {strat_name} disabled via config")
+                continue
             # Flat config (no presets) -> one default instance.
             if "presets" not in cfg:
                 inst = strat_cls(cfg)

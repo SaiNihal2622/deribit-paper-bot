@@ -81,9 +81,10 @@ risk:
   # NEW: drawdown circuit breaker. Pause trading when equity drops
   # more than max_drawdown_pct from the running peak. Auto-resumes
   # when drawdown recovers to within drawdown_recovery_pct.
-  # 8% drawdown pause is conservative; live should be tighter (5%).
-  max_drawdown_pct: 8.0
-  drawdown_recovery_pct: 4.0
+  # 2% drawdown pause — tight because bot was bleeding money
+  # from over-trading in low-vol regime.
+  max_drawdown_pct: 2.0
+  drawdown_recovery_pct: 1.0
   losses_to_defensive: 3       # N consecutive losses -> defensive preset
   wins_to_aggressive: 5        # N consecutive wins -> aggressive preset
   # NEW: adaptive risk presets. The engine picks one based on DVOL
@@ -111,7 +112,7 @@ risk:
       high_iv_rank_threshold: 55.0
 
 strategy:
-  cooldown_sec: 120            # don't re-fire same strategy within 2 min (was 5)
+  cooldown_sec: 600            # was 120 — bot was over-trading in low-vol, 10min cooldown slows churn
   iron_condor:
     wing_width_atm_mult: 0.03  # wing = 3% of spot (tighter for testnet liquidity)
     short_delta: 0.16
@@ -215,9 +216,10 @@ strategy:
       monthly_back:             # 7->30 day calendar (more time-value)
         near_dte: 7
         far_dte: 30
-  long_straddle:               # NEW strategy: vol expansion
-    min_iv_rank: 20.0          # was 30 — fire more often
-    max_iv_rank: 95.0          # was 90
+  long_straddle:               # NEW strategy: vol expansion — DISABLED in low-vol
+    enabled: false             # disabled 2026-09-29: fires constantly with tiny stop, bleeds money
+    min_iv_rank: 50.0          # raised from 20 — only fire in HIGH vol regime
+    max_iv_rank: 95.0
     stop_multiple: 0.5
     target_multiple: 1.0
     confidence: 0.5

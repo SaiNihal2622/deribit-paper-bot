@@ -241,6 +241,58 @@ class PaperClient(BrokerClient):
             self._save_state()
             return order
 
+    # ------------------------------------------------------------------
+    # Kill switch support (parity with DeribitClient)
+    # ------------------------------------------------------------------
+    def cancel_all_open_orders(self, reason: str = "kill_switch") -> list[dict]:
+        """Cancel every PENDING/CANCELLED-but-still-active order."""
+        results: list[dict] = []
+        for oid, o in list(self._orders.items()):
+            if o.status == OrderStatus.COMPLETE:
+                continue
+            try:
+                self.cancel_order(oid)
+                results.append({"order_id": oid, "ok": True, "reason": reason})
+            except Exception as e:
+                results.append({"order_id": oid, "ok": False, "reason": str(e)})
+        return results
+
+    def close_all_positions(self, reason: str = "kill_switch") -> list[dict]:
+        """Mark-to-market close every open position at current LTP.
+
+        For paper trading, we record realized P&L using the latest cached
+        tick LTP and set qty=0 on each position. This simulates "we exited
+        at the current price" — sufficient for a kill-switch trigger where
+        the goal is to stop further loss, not to model perfect exit fills.
+        """
+        results: list[dict] = []
+        with self._lock:
+            for sym, pos in list(self._positions.items()):
+                if int(pos.qty) == 0:
+                    continue
+                # Mark to market: realized P&L = (ltp - avg_price) * qty * contract_size
+                # For closing long: sell at ltp. For closing short: buy at ltp.
+                close_price = float(pos.ltp) if pos.ltp > 0 else float(pos.avg_price)
+                if pos.qty > 0:
+                    # Long: realized = (close_price - avg_price) * qty
+                    realized = (close_price - pos.avg_price) * pos.qty * pos.contract_size
+                    self._cash += close_price * pos.qty * pos.contract_size
+                    self._realized_pnl += realized
+                else:
+                    # Short: realized = (avg_price - close_price) * |qty|
+                    realized = (pos.avg_price - close_price) * abs(pos.qty) * pos.contract_size
+                    self._cash -= close_price * abs(pos.qty) * pos.contract_size
+                    self._realized_pnl += realized
+                results.append({
+                    "symbol": sym, "side": "long" if pos.qty > 0 else "short",
+                    "qty": abs(pos.qty), "ok": True,
+                    "reason": f"closed @ {close_price:.4f} for {reason}, pnl={realized:.4f}",
+                })
+                logger.warning(f"[PAPER KILL-SWITCH] closed {sym} qty={pos.qty} @ {close_price:.4f} pnl={realized:.4f}")
+                pos.qty = 0
+            self._positions = {}
+        return results
+
     def get_order(self, order_id: str) -> Optional[Order]:
         with self._lock:
             return self._orders.get(order_id)
