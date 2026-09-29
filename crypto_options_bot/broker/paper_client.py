@@ -264,25 +264,26 @@ class PaperClient(BrokerClient):
         tick LTP and set qty=0 on each position. This simulates "we exited
         at the current price" — sufficient for a kill-switch trigger where
         the goal is to stop further loss, not to model perfect exit fills.
+
+        Important: the cash adjustment is the NET pnl only, NOT the full
+        close-price notional. The original BUY/SELL already adjusted cash
+        at entry, so the close must add back only the gain/loss.
         """
         results: list[dict] = []
         with self._lock:
             for sym, pos in list(self._positions.items()):
                 if int(pos.qty) == 0:
                     continue
-                # Mark to market: realized P&L = (ltp - avg_price) * qty * contract_size
-                # For closing long: sell at ltp. For closing short: buy at ltp.
                 close_price = float(pos.ltp) if pos.ltp > 0 else float(pos.avg_price)
+                cs = float(getattr(pos, "contract_size", 1.0) or 1.0)
                 if pos.qty > 0:
-                    # Long: realized = (close_price - avg_price) * qty
-                    realized = (close_price - pos.avg_price) * pos.qty * pos.contract_size
-                    self._cash += close_price * pos.qty * pos.contract_size
-                    self._realized_pnl += realized
+                    # Long: P&L = (close - avg) * qty * cs. No cash delta
+                    # at close (entry BUY already deducted avg*qty*cs).
+                    realized = (close_price - pos.avg_price) * pos.qty * cs
                 else:
-                    # Short: realized = (avg_price - close_price) * |qty|
-                    realized = (pos.avg_price - close_price) * abs(pos.qty) * pos.contract_size
-                    self._cash -= close_price * abs(pos.qty) * pos.contract_size
-                    self._realized_pnl += realized
+                    # Short: P&L = (avg - close) * |qty| * cs.
+                    realized = (pos.avg_price - close_price) * abs(pos.qty) * cs
+                self._realized_pnl += realized
                 results.append({
                     "symbol": sym, "side": "long" if pos.qty > 0 else "short",
                     "qty": abs(pos.qty), "ok": True,
@@ -415,7 +416,11 @@ class PaperClient(BrokerClient):
 
     def _apply_fill(self, order: Order) -> None:
         pos = self._positions.get(order.symbol)
-        fill_value = order.filled_qty * order.avg_fill_price * 1.0  # contract_size default 1
+        # Use the order's contract_size (not hardcoded 1.0) so futures
+        # legs with contract_size=0.01 (ETH-PERP) or 0.001 (BTC-PERP)
+        # produce correct cash/notional math. Default to 1.0 for options.
+        cs = float(getattr(order, "contract_size", 1.0) or 1.0)
+        fill_value = order.filled_qty * order.avg_fill_price * cs
         if order.side == OrderSide.BUY:
             self._cash -= fill_value
             if pos:
@@ -447,7 +452,7 @@ class PaperClient(BrokerClient):
                     option_type=order.option_type,
                     expiry=order.expiry,
                     underlying=order.underlying,
-                    contract_size=1.0,
+                    contract_size=float(getattr(order, "contract_size", 1.0) or 1.0),
                     entry_time=datetime.now(timezone.utc),
                 )
         else:  # SELL
@@ -485,7 +490,7 @@ class PaperClient(BrokerClient):
                     option_type=order.option_type,
                     expiry=order.expiry,
                     underlying=order.underlying,
-                    contract_size=1.0,
+                    contract_size=cs,
                     entry_time=datetime.now(timezone.utc),
                 )
 
