@@ -310,7 +310,12 @@ class OrderManager:
             for leg in plan.legs:
                 strike = leg.get("strike", 0)
                 opt_type = leg.get("opt_type", "C")
-                symbol = self._format_symbol(plan.underlying, expiry, strike, opt_type)
+                # If the leg specifies a `symbol` (e.g. for futures like
+                # BTC-PERP), use it directly. Otherwise format as option.
+                if "symbol" in leg and leg["symbol"]:
+                    symbol = leg["symbol"]
+                else:
+                    symbol = self._format_symbol(plan.underlying, expiry, strike, opt_type)
                 order = Order(
                     symbol=symbol,
                     side=OrderSide(leg["side"]),
@@ -324,6 +329,10 @@ class OrderManager:
                     expiry=expiry,
                     underlying=plan.underlying,
                 )
+                # Pass through contract_size for futures legs (paper broker
+                # uses this for P&L math on leveraged positions).
+                if "contract_size" in leg:
+                    order.contract_size = float(leg["contract_size"])
                 placed = self.broker.place_order(order)
                 trade.orders.append(placed)
             self._trades[trade_id] = trade

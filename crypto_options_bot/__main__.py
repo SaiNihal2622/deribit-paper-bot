@@ -79,6 +79,7 @@ from .strategy.directional_debit import DirectionalDebitStrategy
 from .strategy.calendar_spread import CalendarSpreadStrategy
 from .strategy.long_straddle import LongStraddleStrategy
 from .strategy.debit_spread import DebitSpreadStrategy
+from .strategy.futures_trend import FuturesTrendStrategy
 from .utils.logger import setup_logger
 
 # Type hint for the union of the two feed types. Avoid importing the WS feed
@@ -776,6 +777,7 @@ class PaperRunner:
             ("short_call", ShortCallStrategy),
             ("debit_spread", DebitSpreadStrategy),
             ("directional_debit", DirectionalDebitStrategy),
+            ("futures_trend", FuturesTrendStrategy),
             ("calendar_spread", CalendarSpreadStrategy),
             ("long_straddle", LongStraddleStrategy),
         ]

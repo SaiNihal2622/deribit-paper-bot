@@ -75,10 +75,9 @@ risk:
   # Position sizing — the risk engine scales qty so each trade's max
   # loss approximates max_trade_loss_pct of capital. Capped here so a
   # single trade can't exceed this many contracts (exchange rate-limit
-  # safety). 200 contracts * $0.37 stop ≈ $74/trade, well within the
-  # 2% capital risk budget — we cap to prevent runaway sizing on tiny
-  # stop values.
-  max_contracts_per_trade: 200
+  # safety). For paper trading we cap higher (2000) than for live (200)
+  # since the broker is a simulator.
+  max_contracts_per_trade: 2000
   losses_to_defensive: 3       # N consecutive losses -> defensive preset
   wins_to_aggressive: 5        # N consecutive wins -> aggressive preset
   # NEW: adaptive risk presets. The engine picks one based on DVOL
@@ -90,14 +89,14 @@ risk:
       max_trade_loss_pct: 2.5
       high_dvol_threshold: 90.0
       high_iv_rank_threshold: 80.0
-      max_contracts_per_trade: 300
+      max_contracts_per_trade: 3000
     base:
       max_open_positions: 10
       max_daily_loss_pct: 5.0
       max_trade_loss_pct: 2.0
       high_dvol_threshold: 80.0
       high_iv_rank_threshold: 75.0
-      max_contracts_per_trade: 200
+      max_contracts_per_trade: 2000
     defensive:
       max_open_positions: 2
       max_daily_loss_pct: 2.5
@@ -186,6 +185,14 @@ strategy:
     max_dte: 21
     target_multiple: 2.5       # take profit at 2.5x debit (typical 3:1 R:R)
     stop_multiple: 0.5         # stop at 50% of debit
+    confidence: 0.55
+  futures_trend:              # NEW strategy: leveraged directional futures
+    min_momentum: 0.005        # 0.5% move to fire
+    min_adx: 20.0
+    atr_period: 14
+    atr_stop_mult: 2.0         # stop = 2x ATR
+    atr_target_mult: 6.0       # target = 6x ATR (3:1 R:R)
+    leverage: 5.0              # paper-trade 5x; live should be 3-5x
     confidence: 0.55
   calendar_spread:             # NEW strategy: time-decay
     min_iv_rank: 15.0

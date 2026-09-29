@@ -22,6 +22,7 @@ class StrategyName(str, Enum):
     CALENDAR_SPREAD = "calendar_spread"
     LONG_STRADDLE = "long_straddle"
     DEBIT_SPREAD = "debit_spread"
+    FUTURES_TREND = "futures_trend"
 
 
 @dataclass

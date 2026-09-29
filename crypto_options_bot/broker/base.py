@@ -82,6 +82,8 @@ class Order:
 
     # paper-specific: the price we expect to fill at, used by the fill simulator
     expected_fill_price: float = 0.0
+    # contract_size for futures legs (BTC-PERP = 0.001, ETH-PERP = 0.01)
+    contract_size: float = 1.0
 
 
 @dataclass
