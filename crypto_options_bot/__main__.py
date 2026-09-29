@@ -78,6 +78,7 @@ from .strategy.short_call import ShortCallStrategy
 from .strategy.directional_debit import DirectionalDebitStrategy
 from .strategy.calendar_spread import CalendarSpreadStrategy
 from .strategy.long_straddle import LongStraddleStrategy
+from .strategy.debit_spread import DebitSpreadStrategy
 from .utils.logger import setup_logger
 
 # Type hint for the union of the two feed types. Avoid importing the WS feed
@@ -766,11 +767,14 @@ class PaperRunner:
         strategies = []
 
         # Map of strategy_name -> (class, base_default_config)
-        # Order matters: more conservative strategies first.
+        # Order matters: more conservative strategies first; long-premium
+        # (defined-risk, asymmetric R:R) strategies come AFTER short-premium
+        # so they fire when conditions for them are met.
         registry = [
             ("iron_condor", IronCondorStrategy),
             ("short_strangle", ShortStrangleStrategy),
             ("short_call", ShortCallStrategy),
+            ("debit_spread", DebitSpreadStrategy),
             ("directional_debit", DirectionalDebitStrategy),
             ("calendar_spread", CalendarSpreadStrategy),
             ("long_straddle", LongStraddleStrategy),

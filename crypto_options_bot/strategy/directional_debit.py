@@ -40,14 +40,11 @@ class DirectionalDebitStrategy(BaseStrategy):
 
     # ------------------------------------------------------------------
     def is_eligible(self, ctx: SignalContext, account_state: dict) -> tuple[bool, str]:
-        if ctx.regime not in ("trending", "volatile"):
-            return False, f"regime={ctx.regime} not trending/volatile"
+        # NOTE: regime check loosened — momentum is the primary signal,
+        # regime can lag. We still avoid firing in clearly compressed vol.
         if not ctx.strikes or len(ctx.strikes) < 3:
             return False, f"insufficient strikes: {len(ctx.strikes or [])}"
         if not hasattr(ctx, "_momentum"):
-            # We don't get momentum on the SignalContext directly; the runner
-            # sets it as a side-channel via `account_state`. Fall back to
-            # trend_strength if not set.
             momentum = float(account_state.get("momentum", 0.0) or 0.0)
         else:
             momentum = float(ctx._momentum)

@@ -177,6 +177,16 @@ strategy:
         min_momentum: 0.005
         max_iv_rank: 65
         confidence: 0.45
+  debit_spread:               # NEW strategy: long call/put spread (defined R:R)
+    min_momentum: 0.003        # fire on any meaningful momentum (0.3%+)
+    spread_width_pct: 0.05     # 5% wide spread
+    min_iv_rank: 15.0
+    max_iv_rank: 85.0
+    min_dte: 5
+    max_dte: 21
+    target_multiple: 2.5       # take profit at 2.5x debit (typical 3:1 R:R)
+    stop_multiple: 0.5         # stop at 50% of debit
+    confidence: 0.55
   calendar_spread:             # NEW strategy: time-decay
     min_iv_rank: 15.0
     max_iv_rank: 70.0          # was 50 — let it fire in mid-vol regimes too

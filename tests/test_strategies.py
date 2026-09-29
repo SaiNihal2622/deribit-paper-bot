@@ -128,11 +128,15 @@ def test_directional_debit_picks_call_or_put():
     assert plan2.legs[0]["opt_type"] == "P"
 
 
-def test_directional_debit_rejects_range_regime():
+def test_directional_debit_accepts_range_regime():
+    """Regime check was loosened — momentum is the primary signal,
+    regime can lag. Long-premium strategies should fire on momentum
+    regardless of regime classification.
+    """
     s = DirectionalDebitStrategy()
     ctx = _ctx(regime="range")
-    eligible, _ = s.is_eligible(ctx, {"momentum": 0.05})
-    assert eligible is False
+    eligible, reason = s.is_eligible(ctx, {"momentum": 0.05})
+    assert eligible is True, reason
 
 
 # ---------------------------------------------------------------------------
