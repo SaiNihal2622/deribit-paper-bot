@@ -454,73 +454,60 @@ class DeribitClient(BrokerClient):
     # Internals
     # ------------------------------------------------------------------
     def _refresh_positions(self) -> None:
-        """Pull positions from /private/get_positions and hydrate the cache."""
-        payload = {
-            "jsonrpc": "2.0",
-            "id": int(time.time() * 1000) & 0x7FFFFFFF,
-            "method": "private/get_positions",
-            "params": {"currency": "BTC", "kind": "option"},
-        }
-        url = f"{self.base_url}/private/get_positions"
-        resp = _post_json(url, payload, headers=self._auth_headers(), timeout=self.timeout)
-        rows = resp.get("result") or []
+        """Pull positions from /private/get_positions and hydrate the cache.
+
+        Queries both options and futures positions for BTC and ETH. The
+        Deribit API requires currency-specific calls; we iterate currencies
+        and kinds so the in-memory `_positions` dict always reflects the
+        full live book.
+        """
         new_positions: dict[str, Position] = {}
-        for r in rows:
-            try:
-                size = float(r.get("size", 0) or 0)
-                if size == 0:
+        for ccy in ("BTC", "ETH"):
+            for kind in ("option", "future"):
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": int(time.time() * 1000) & 0x7FFFFFFF,
+                    "method": "private/get_positions",
+                    "params": {"currency": ccy, "kind": kind},
+                }
+                url = f"{self.base_url}/private/get_positions"
+                try:
+                    resp = _post_json(url, payload, headers=self._auth_headers(), timeout=self.timeout)
+                except Exception as e:
+                    logger.warning(f"_refresh_positions({ccy}, {kind}) failed: {e}")
                     continue
-                symbol = r.get("instrument_name", "")
-                avg_price = float(r.get("average_price", 0) or 0)
-                mark_price = float(r.get("mark_price", 0) or 0)
-                pnl = float(r.get("floating_profit_loss", 0) or 0)
-                strike = float(r.get("strike", 0) or 0)
-                opt_type = r.get("option_type", "")
-                expiry = str(r.get("expiration_timestamp", ""))[:10] or None
-                pos = Position(
-                    symbol=symbol,
-                    qty=int(size),
-                    avg_price=avg_price,
-                    ltp=mark_price,
-                    exchange="DERIBIT",
-                    pnl=pnl,
-                    strike=strike,
-                    option_type=opt_type,
-                    expiry=expiry,
-                    underlying=r.get("underlying", ""),
-                    contract_size=1.0,
-                )
-                new_positions[symbol] = pos
-            except Exception as e:
-                logger.debug(f"position parse error: {e}")
-        # Also fetch ETH positions (the API requires currency-specific calls)
-        for ccy in ("ETH",):
-            try:
-                payload["params"]["currency"] = ccy
-                resp2 = _post_json(url, payload, headers=self._auth_headers(), timeout=self.timeout)
-                for r in resp2.get("result") or []:
-                    size = float(r.get("size", 0) or 0)
-                    if size == 0:
-                        continue
-                    symbol = r.get("instrument_name", "")
-                    avg_price = float(r.get("average_price", 0) or 0)
-                    mark_price = float(r.get("mark_price", 0) or 0)
-                    pnl = float(r.get("floating_profit_loss", 0) or 0)
-                    new_positions[symbol] = Position(
-                        symbol=symbol,
-                        qty=int(size),
-                        avg_price=avg_price,
-                        ltp=mark_price,
-                        exchange="DERIBIT",
-                        pnl=pnl,
-                        strike=float(r.get("strike", 0) or 0),
-                        option_type=r.get("option_type", ""),
-                        expiry=str(r.get("expiration_timestamp", ""))[:10] or None,
-                        underlying=ccy,
-                        contract_size=1.0,
-                    )
-            except Exception as e:
-                logger.debug(f"DeribitClient ETH positions fetch failed: {e}")
+                rows = resp.get("result") or []
+                for r in rows:
+                    try:
+                        size = float(r.get("size", 0) or 0)
+                        if size == 0:
+                            continue
+                        symbol = r.get("instrument_name", "")
+                        avg_price = float(r.get("average_price", 0) or 0)
+                        mark_price = float(r.get("mark_price", 0) or 0)
+                        pnl = float(r.get("floating_profit_loss", 0) or 0)
+                        strike = float(r.get("strike", 0) or 0)
+                        opt_type = r.get("option_type", "")
+                        # For futures, contract_size is meaningful (e.g. 0.001
+                        # for BTC-PERP). Deribit returns it under the same field.
+                        contract_size = float(r.get("contract_size", 1.0) or 1.0)
+                        expiry = str(r.get("expiration_timestamp", ""))[:10] or None
+                        pos = Position(
+                            symbol=symbol,
+                            qty=int(size),
+                            avg_price=avg_price,
+                            ltp=mark_price,
+                            exchange="DERIBIT",
+                            pnl=pnl,
+                            strike=strike,
+                            option_type=opt_type,
+                            expiry=expiry,
+                            underlying=r.get("underlying", "") or ccy,
+                            contract_size=contract_size,
+                        )
+                        new_positions[symbol] = pos
+                    except Exception as e:
+                        logger.debug(f"position parse error: {e}")
         with self._lock:
             self._positions = new_positions
 
@@ -564,21 +551,98 @@ class DeribitClient(BrokerClient):
 
     # Optional convenience: list open orders (used by the dashboard).
     def get_open_orders(self) -> list[Order]:
+        """Return all open orders across both options and futures.
+
+        Deribit returns orders per-kind, so we iterate. Empty list on any
+        failure (logged at warning level).
+        """
+        all_orders: list[Order] = []
+        for kind in ("option", "future"):
+            try:
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": int(time.time() * 1000) & 0x7FFFFFFF,
+                    "method": "private/get_open_orders",
+                    "params": {"kind": kind},
+                }
+                url = f"{self.base_url}/private/get_open_orders"
+                resp = _post_json(url, payload, headers=self._auth_headers(), timeout=self.timeout)
+                all_orders.extend(self._hydrate_order_from_state(r) for r in (resp.get("result") or []))
+            except Exception as e:
+                logger.warning(f"DeribitClient.get_open_orders({kind}) failed: {e}")
+        return all_orders
+
+    # ------------------------------------------------------------------
+    # Reconciliation + kill switch for live trading
+    # ------------------------------------------------------------------
+    def close_all_positions(self, reason: str = "kill_switch") -> list[dict]:
+        """Emergency close all open positions at market.
+
+        Sends a MARKET sell for every long position and MARKET buy for
+        every short position. Used by the kill switch in __main__.py to
+        unwind the book if anything goes wrong (large drawdown, suspicious
+        activity, manual panic button).
+
+        Returns a list of result dicts: {symbol, side, qty, ok, reason}.
+        """
+        results: list[dict] = []
         try:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": int(time.time() * 1000) & 0x7FFFFFFF,
-                "method": "private/get_open_orders",
-                "params": {"kind": "option"},
-            }
-            url = f"{self.base_url}/private/get_open_orders"
-            resp = _post_json(url, payload, headers=self._auth_headers(), timeout=self.timeout)
-            return [
-                self._hydrate_order_from_state(r) for r in (resp.get("result") or [])
-            ]
+            positions = self.get_positions()
         except Exception as e:
-            logger.warning(f"DeribitClient.get_open_orders failed: {e}")
-            return []
+            logger.warning(f"close_all_positions: get_positions failed: {e}")
+            return [{"symbol": "*", "side": "*", "qty": 0, "ok": False, "reason": str(e)}]
+        for sym, pos in positions:
+            if int(pos.qty) == 0:
+                continue
+            try:
+                # Long → sell, short → buy
+                side = OrderSide.SELL if pos.qty > 0 else OrderSide.BUY
+                qty = abs(int(pos.qty))
+                endpoint = "/private/sell" if side == OrderSide.BUY else "/private/buy"
+                # The above ternary looks inverted — we want the side of the
+                # CLOSING order, which is opposite of the position direction.
+                endpoint = "/private/sell" if pos.qty > 0 else "/private/buy"
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": int(time.time() * 1000) & 0x7FFFFFFF,
+                    "method": endpoint,
+                    "params": {
+                        "instrument_name": pos.symbol,
+                        "amount": qty,
+                        "type": "market",
+                        "label": f"kill_switch:{reason}",
+                    },
+                }
+                url = f"{self.base_url}{endpoint}"
+                resp = _post_json(url, payload, headers=self._auth_headers(), timeout=self.timeout)
+                r = resp.get("result") or {}
+                ok = bool(r.get("order_id"))
+                results.append({
+                    "symbol": pos.symbol, "side": side.value, "qty": qty,
+                    "ok": ok, "reason": reason if not ok else "closed",
+                })
+                logger.warning(
+                    f"[KILL-SWITCH] closed {qty} {pos.symbol} ({reason}) ok={ok}"
+                )
+            except Exception as e:
+                logger.warning(f"close_all_positions: failed on {pos.symbol}: {e}")
+                results.append({
+                    "symbol": pos.symbol, "side": "?", "qty": 0,
+                    "ok": False, "reason": str(e),
+                })
+        return results
+
+    def cancel_all_open_orders(self, reason: str = "kill_switch") -> list[dict]:
+        """Cancel every pending order (limit, stop, etc.) on the exchange."""
+        results: list[dict] = []
+        for o in self.get_open_orders():
+            try:
+                self.cancel_order(o.order_id)
+                results.append({"order_id": o.order_id, "ok": True, "reason": reason})
+                logger.warning(f"[KILL-SWITCH] cancelled order {o.order_id} ({reason})")
+            except Exception as e:
+                results.append({"order_id": o.order_id, "ok": False, "reason": str(e)})
+        return results
 
 
 __all__ = ["DeribitClient", "DeribitAuthError", "DeribitSafetyError", "TESTNET_BASE", "PROD_BASE"]

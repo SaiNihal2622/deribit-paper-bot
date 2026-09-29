@@ -1652,6 +1652,42 @@ class PaperRunner:
                 except Exception as e:
                     logger.debug(f"force-action loop error: {e}")
 
+                # Kill switch: data_cache/kill_switch.json triggers an
+                # emergency close-all. Cheap to check (stat-only); runs
+                # every cycle so the operator's panic button is responsive.
+                try:
+                    ks = os.path.join("data_cache", "kill_switch.json")
+                    if os.path.exists(ks):
+                        with open(ks, "r", encoding="utf-8") as f:
+                            ks_data = json.load(f)
+                        reason = ks_data.get("reason", "manual")
+                        logger.warning(f"[KILL-SWITCH] triggered: {reason}")
+                        # Cancel pending orders first, then close positions.
+                        try:
+                            cancel_results = broker.cancel_all_open_orders(reason=reason)
+                            logger.warning(
+                                f"[KILL-SWITCH] cancelled {sum(1 for r in cancel_results if r.get('ok'))} orders"
+                            )
+                        except Exception as e:
+                            logger.warning(f"[KILL-SWITCH] cancel failed: {e}")
+                        try:
+                            close_results = broker.close_all_positions(reason=reason)
+                            logger.warning(
+                                f"[KILL-SWITCH] closed {sum(1 for r in close_results if r.get('ok'))}/{len(close_results)} positions"
+                            )
+                        except Exception as e:
+                            logger.warning(f"[KILL-SWITCH] close failed: {e}")
+                        # Pause risk engine so no new trades fire.
+                        risk.pause(reason=f"kill_switch: {reason}")
+                        # Rename the kill file so it doesn't fire again
+                        ts2 = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                        try:
+                            os.replace(ks, ks + f".consumed-{ts2}")
+                        except Exception:
+                            os.remove(ks)
+                except Exception as e:
+                    logger.debug(f"kill-switch loop error: {e}")
+
                 # Throttled idle-mode LLM check: when nothing was executed this
                 # cycle (e.g. regime gate closed everything), still ask the
                 # Trader LLM whether it agrees with staying flat. Generates a

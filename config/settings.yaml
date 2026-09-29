@@ -249,10 +249,16 @@ agent:
   llm_model: minimax/MiniMax-M3    # default; pick a faster model for cost
   memory_dir: memory
   sentinel_interval_sec: 60.0
-  evolver_interval_sec: 86400.0     # 24 hours (was 6h) — reduce LLM calls when running unattended
+  # Self-evolving: run evolver every 30 minutes (was 24h) so the bot
+  # tunes strategy parameters and risk caps in real-time based on
+  # recent P&L. Tight loop = bot adapts to regime changes within
+  # the trading session instead of waiting overnight.
+  evolver_interval_sec: 1800.0     # 30 minutes
   reflector_at_hhmm: "00:05"        # daily, UTC
   heartbeat_interval_sec: 30.0
-  llm_probe_interval_sec: 21600.0   # 6 hours (was 1h) — reduce LLM calls when running unattended
+  # LLM probe: 1 hour (was 6h) — re-check the model + provider every hour
+  # so a flaky LLM gets swapped out within an hour.
+  llm_probe_interval_sec: 3600.0
   daily_token_limit: 500000
   daily_call_limit: 5000
   # Autonomy: low-risk evolver proposals are deployed automatically.
