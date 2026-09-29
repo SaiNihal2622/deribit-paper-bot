@@ -80,6 +80,11 @@ class RiskState:
     consecutive_losses: int = 0
     consecutive_wins: int = 0
     last_preset_change: float = 0.0  # monotonic ts
+    # NEW: drawdown circuit breaker (track running peak equity)
+    peak_equity: float = 0.0          # highest equity seen since boot
+    drawdown_pct: float = 0.0        # current drawdown as % of peak
+    drawdown_paused: bool = False    # True when circuit breaker triggered
+    drawdown_pause_reason: str = ""  # last reason the breaker tripped
 
 
 @dataclass
@@ -134,6 +139,11 @@ class RiskEngine:
         # Consecutive-loss adaptive switching
         self._losses_to_defensive = int(cfg.get("losses_to_defensive", 3))
         self._wins_to_aggressive = int(cfg.get("wins_to_aggressive", 5))
+        # Drawdown circuit breaker: pause trading when equity drops
+        # more than max_drawdown_pct from running peak. Auto-resume when
+        # drawdown recovers to within drawdown_recovery_pct.
+        self._max_drawdown_pct = float(cfg.get("max_drawdown_pct", 8.0))
+        self._drawdown_recovery_pct = float(cfg.get("drawdown_recovery_pct", 4.0))
         # Preset definitions (override defaults with config)
         self._presets: dict[str, dict] = copy.deepcopy(DEFAULT_PRESETS)
         if isinstance(cfg.get("presets"), dict):
@@ -150,6 +160,9 @@ class RiskEngine:
     # ------------------------------------------------------------------
     def update_capital(self, capital: float) -> None:
         self.state.capital = float(capital)
+        # Update peak-equity tracker for drawdown circuit breaker.
+        if capital > self.state.peak_equity:
+            self.state.peak_equity = float(capital)
 
     def update_market_state(self, dvol: float = 0.0, iv_rank: float = 50.0) -> None:
         """Update the cached market state (called every poll cycle)."""
@@ -162,6 +175,58 @@ class RiskEngine:
     def update_daily_pnl(self, pnl: float) -> None:
         self._roll_period()
         self.state.daily_pnl = float(pnl)
+
+    def update_equity(self, equity: float) -> None:
+        """Track running equity (cash + unrealized P&L) for drawdown tracking.
+
+        Updates peak-equity and current drawdown. When drawdown exceeds
+        ``max_drawdown_pct``, sets ``drawdown_paused = True`` which causes
+        ``check_trade`` to refuse all new trades until manually resumed or
+        equity recovers past the recovery threshold.
+        """
+        self._roll_period()
+        equity = float(equity)
+        if equity > self.state.peak_equity:
+            self.state.peak_equity = equity
+        if self.state.peak_equity > 0:
+            self.state.drawdown_pct = max(
+                0.0, (self.state.peak_equity - equity) / self.state.peak_equity * 100.0
+            )
+        else:
+            self.state.drawdown_pct = 0.0
+        self._check_drawdown_breaker(equity)
+
+    def _check_drawdown_breaker(self, equity: float) -> None:
+        """Trigger drawdown pause when equity drops > max_drawdown_pct from peak."""
+        if self.state.drawdown_paused:
+            # Already paused — check recovery (equity back within recovery threshold
+            # of peak, e.g. recovered 50% of the way back).
+            if self.state.drawdown_pct <= self._drawdown_recovery_pct:
+                self.state.drawdown_paused = False
+                self.state.drawdown_pause_reason = ""
+                logger.info(
+                    f"RiskEngine drawdown breaker RECOVERED: "
+                    f"drawdown={self.state.drawdown_pct:.2f}% <= "
+                    f"recovery={self._drawdown_recovery_pct:.2f}%, "
+                    f"resuming trades"
+                )
+            return
+        # Not paused — check if drawdown exceeds threshold
+        if self.state.drawdown_pct >= self._max_drawdown_pct:
+            self.state.drawdown_paused = True
+            self.state.drawdown_pause_reason = (
+                f"drawdown {self.state.drawdown_pct:.2f}% >= "
+                f"max_drawdown_pct {self._max_drawdown_pct:.2f}%"
+            )
+            self.pause(reason=self.state.drawdown_pause_reason)
+
+    def resume_from_drawdown(self) -> None:
+        """Manually resume after a drawdown pause."""
+        self.state.drawdown_paused = False
+        self.state.drawdown_pause_reason = ""
+        self.state.paused = False
+        self.state.pause_reason = ""
+        logger.info("RiskEngine drawdown breaker manually resumed")
 
     def record_trade_result(self, pnl: float) -> None:
         """Track a closed trade's P&L for adaptive preset selection.
@@ -244,6 +309,17 @@ class RiskEngine:
             return RiskDecision(
                 allowed=False,
                 reason=f"paused: {self.state.pause_reason}",
+                suggested_qty=0,
+                preset=self.state.preset,
+            )
+
+        # Drawdown circuit breaker — refuse new trades when equity has
+        # fallen more than max_drawdown_pct from peak. Auto-resumes when
+        # recovery threshold is met.
+        if self.state.drawdown_paused:
+            return RiskDecision(
+                allowed=False,
+                reason=f"drawdown breaker: {self.state.drawdown_pause_reason}",
                 suggested_qty=0,
                 preset=self.state.preset,
             )

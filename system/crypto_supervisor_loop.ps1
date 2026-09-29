@@ -77,14 +77,43 @@ function Start-NssmService([string]$service) {
 function Restart-BotViaNssm() {
     try {
         Log "[supervisor] restarting $SERVICE_BOT via NSSM (liveness stale or dead)"
+        # Telegram alert: bot died, supervisor is restarting it.
+        # Disabled if env vars unset (preserves the no-alerts default).
+        $telegramToken = $env:TELEGRAM_BOT_TOKEN
+        $telegramChat = $env:TELEGRAM_CHAT_ID
+        if ($telegramToken -and $telegramChat) {
+            $livenessAge = (Get-BotLivenessAge)
+            $pid = (Get-BotPid)
+            $msg = "🚨 crypto-bot DEAD: pid=$pid liveness_age=${livenessAge}s - supervisor restarting now"
+            try {
+                $payload = @{chat_id=$telegramChat; text=$msg} | ConvertTo-Json -Compress
+                $tgUri = "https://api.telegram.org/bot$telegramToken/sendMessage"
+                Invoke-RestMethod -Uri $tgUri -Method Post -ContentType "application/json" -Body $payload -TimeoutSec 5 | Out-Null
+            } catch {
+                Log "[supervisor] telegram alert failed: $_"
+            }
+        }
         # Clean up orphan zombies FIRST so NSSM restart doesn't wedge on file locks
         & $PYTHON_EXE (Join-Path $ROOT 'scripts\crypto_orphan_killer.py') --clean 2>&1 | Out-Null
         $p = Start-Process -FilePath $NSSM_EXE -ArgumentList @('restart', $SERVICE_BOT) -Wait -PassThru -NoNewWindow
         if ($p.ExitCode -eq 0) {
             Log "[supervisor] restart OK (exit=0)"
+            # Notify restart success too
+            if ($telegramToken -and $telegramChat) {
+                try {
+                    $payload = @{chat_id=$telegramChat; text="✅ crypto-bot restarted OK via NSSM"} | ConvertTo-Json -Compress
+                    Invoke-RestMethod -Uri "https://api.telegram.org/bot$telegramToken/sendMessage" -Method Post -ContentType "application/json" -Body $payload -TimeoutSec 5 | Out-Null
+                } catch {}
+            }
             return $true
         } else {
             Log "[supervisor] restart exit=$($p.ExitCode)"
+            if ($telegramToken -and $telegramChat) {
+                try {
+                    $payload = @{chat_id=$telegramChat; text="❌ crypto-bot restart FAILED exit=$($p.ExitCode)"} | ConvertTo-Json -Compress
+                    Invoke-RestMethod -Uri "https://api.telegram.org/bot$telegramToken/sendMessage" -Method Post -ContentType "application/json" -Body $payload -TimeoutSec 5 | Out-Null
+                } catch {}
+            }
             return $false
         }
     } catch {

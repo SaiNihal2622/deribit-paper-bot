@@ -181,6 +181,29 @@ class TelegramAlerter:
         except Exception as e:
             logger.debug(f"notify_daily_summary error: {e}")
 
+    def notify_drawdown_pause(self, underlying, drawdown_pct: float,
+                              max_pct: float, equity: float) -> None:
+        """Notify when the drawdown circuit breaker trips.
+
+        Args:
+            underlying: "BTC" / "ETH" / None (whole portfolio)
+            drawdown_pct: current drawdown as % of peak
+            max_pct: configured max_drawdown_pct threshold
+            equity: current equity (cash + unrealized)
+        """
+        if not self.enabled:
+            return
+        try:
+            scope = underlying or "PORTFOLIO"
+            msg = (
+                f"DRAWDOWN PAUSE: {scope} drawdown={drawdown_pct:.2f}% >= "
+                f"max={max_pct:.2f}% equity=${equity:,.2f} — "
+                f"trading HALTED, auto-resumes on recovery"
+            )
+            self.send(msg)
+        except Exception as e:
+            logger.debug(f"notify_drawdown_pause error: {e}")
+
     # ------------------------------------------------------------------
     def _worker(self) -> None:
         """Drain the queue, sending each message via Telegram Bot API."""

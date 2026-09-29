@@ -78,6 +78,12 @@ risk:
   # safety). For paper trading we cap higher (2000) than for live (200)
   # since the broker is a simulator.
   max_contracts_per_trade: 2000
+  # NEW: drawdown circuit breaker. Pause trading when equity drops
+  # more than max_drawdown_pct from the running peak. Auto-resumes
+  # when drawdown recovers to within drawdown_recovery_pct.
+  # 8% drawdown pause is conservative; live should be tighter (5%).
+  max_drawdown_pct: 8.0
+  drawdown_recovery_pct: 4.0
   losses_to_defensive: 3       # N consecutive losses -> defensive preset
   wins_to_aggressive: 5        # N consecutive wins -> aggressive preset
   # NEW: adaptive risk presets. The engine picks one based on DVOL

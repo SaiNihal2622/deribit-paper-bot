@@ -368,6 +368,10 @@ class PaperRunner:
                     risk_ref.high_iv_rank_threshold = float(risk_cfg["high_iv_rank_threshold"])
                 if "max_contracts_per_trade" in risk_cfg:
                     risk_ref.max_contracts_per_trade = int(risk_cfg["max_contracts_per_trade"])
+                if "max_drawdown_pct" in risk_cfg:
+                    risk_ref._max_drawdown_pct = float(risk_cfg["max_drawdown_pct"])
+                if "drawdown_recovery_pct" in risk_cfg:
+                    risk_ref._drawdown_recovery_pct = float(risk_cfg["drawdown_recovery_pct"])
             logger.info(
                 "config reloaded: cooldown=%.0fs  regime_gate=%s  thresholds=%s",
                 self._cooldown_sec,
@@ -1577,6 +1581,24 @@ class PaperRunner:
                 positions = broker.get_positions()
                 risk.update_open_positions(len(order_mgr.open_trades()))
                 risk.update_daily_pnl(broker._realized_pnl + sum(p.pnl for p in positions))
+                # Track equity for drawdown circuit breaker.
+                unrealized = sum(p.pnl for p in positions)
+                equity = float(getattr(broker, "_realized_pnl", 0.0) or 0.0) + unrealized + \
+                         float(getattr(broker, "starting_capital", 100000.0) or 100000.0)
+                risk.update_equity(equity)
+                # If the breaker tripped this cycle, fire a one-shot Telegram
+                # alert so the operator knows.
+                if risk.state.drawdown_paused and not getattr(self, "_drawdown_alert_sent", False):
+                    if self.alerter is not None:
+                        self.alerter.notify_drawdown_pause(
+                            underlying=None,
+                            drawdown_pct=risk.state.drawdown_pct,
+                            max_pct=risk._max_drawdown_pct,
+                            equity=equity,
+                        )
+                    self._drawdown_alert_sent = True
+                if not risk.state.drawdown_paused:
+                    self._drawdown_alert_sent = False
                 for underlying in feed.currencies:
                     ctx = self._build_signal_context(underlying, feed, broker)
                     if ctx is None:

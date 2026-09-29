@@ -208,3 +208,96 @@ def test_qty_floor_is_one_when_stop_is_tiny():
                                        "capital": 100_000.0})
     assert d.allowed
     assert d.suggested_qty == 200
+
+
+# ---------- Drawdown circuit breaker tests ----------
+
+
+def test_drawdown_breaker_trips_when_equity_drops():
+    """When equity drops > max_drawdown_pct from peak, pause all trades."""
+    eng = RiskEngine({
+        "starting_capital": 100_000.0,
+        "max_drawdown_pct": 8.0,
+        "drawdown_recovery_pct": 4.0,
+        "max_open_positions": 10,
+    })
+    # Initial equity → peak = 100000
+    eng.update_equity(100_000.0)
+    assert eng.state.peak_equity == 100_000.0
+    assert eng.state.drawdown_paused is False
+
+    # Equity drops 10% — should trip breaker
+    eng.update_equity(90_000.0)
+    assert eng.state.drawdown_pct >= 10.0
+    assert eng.state.drawdown_paused is True
+    assert "drawdown" in eng.state.drawdown_pause_reason.lower()
+
+    # Next trade is refused
+    d = eng.check_trade(_plan(stop=200.0, target=100.0),
+                        account_state={"open_positions": 0, "realized_pnl": -10_000.0,
+                                       "capital": 90_000.0})
+    assert not d.allowed
+    assert "drawdown" in d.reason.lower()
+
+
+def test_drawdown_breaker_auto_recovers_on_bounce():
+    """If equity recovers to within recovery threshold, breaker releases."""
+    eng = RiskEngine({
+        "starting_capital": 100_000.0,
+        "max_drawdown_pct": 8.0,
+        "drawdown_recovery_pct": 4.0,
+    })
+    eng.update_equity(100_000.0)
+    eng.update_equity(88_000.0)   # 12% drawdown → trip
+    assert eng.state.drawdown_paused is True
+
+    # Equity recovers to within 4% of peak → auto-resume
+    eng.update_equity(97_000.0)
+    assert eng.state.drawdown_paused is False
+    assert eng.state.drawdown_pct < 4.0
+
+
+def test_drawdown_breaker_stays_paused_during_partial_recovery():
+    """If equity recovers but not enough, breaker stays on."""
+    eng = RiskEngine({
+        "max_drawdown_pct": 8.0,
+        "drawdown_recovery_pct": 4.0,
+    })
+    eng.update_equity(100_000.0)
+    eng.update_equity(85_000.0)   # 15% drawdown
+    assert eng.state.drawdown_paused is True
+    # Recover to 92k (8% drawdown, > 4% recovery threshold)
+    eng.update_equity(92_000.0)
+    assert eng.state.drawdown_paused is True
+
+
+def test_drawdown_breaker_manual_resume():
+    """Operator can manually resume after drawdown pause."""
+    eng = RiskEngine({
+        "max_drawdown_pct": 5.0,
+    })
+    eng.update_equity(100_000.0)
+    eng.update_equity(80_000.0)   # 20% drawdown
+    assert eng.state.drawdown_paused is True
+    eng.resume_from_drawdown()
+    assert eng.state.drawdown_paused is False
+    assert eng.state.paused is False
+
+
+def test_drawdown_breaker_peak_only_rises():
+    """Peak equity should only rise (never decrease) on updates."""
+    eng = RiskEngine({})
+    eng.update_equity(50_000.0)
+    eng.update_equity(60_000.0)
+    eng.update_equity(55_000.0)   # drops, but peak stays at 60k
+    assert eng.state.peak_equity == 60_000.0
+
+
+def test_drawdown_breaker_no_pause_below_threshold():
+    """Small drawdowns (below max_drawdown_pct) don't trigger pause."""
+    eng = RiskEngine({
+        "max_drawdown_pct": 8.0,
+    })
+    eng.update_equity(100_000.0)
+    eng.update_equity(95_000.0)   # 5% drawdown
+    assert eng.state.drawdown_paused is False
